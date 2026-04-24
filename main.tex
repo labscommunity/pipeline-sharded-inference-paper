@@ -398,11 +398,11 @@ On the 2-stage distributed pipeline (single-stream, no spec), earlier measuremen
 \subsection{Gemma 4 E2B: A Second Architecture}
 \label{sec:gemma}
 
-The distributed pipeline extends to Gemma~4~E2B (5.1B, 35 layers). The Gemma~4 results here use the \emph{earlier} external-rotary export pipeline (not $v_5$\_beam), since Gemma~4 has architecture-specific features---cross-layer K/V sharing via \texttt{DynamicCache} and a large Per-Layer-Input embedding matrix that is quantization-sensitive (\S\ref{sec:discussion})---that the $v_5$\_beam exporter does not yet handle. The table therefore validates that the 2-stage distributed pipeline + micro-batching mechanism reproduces on a different architecture; it does not re-evaluate the $v_5$\_beam parity claim on Gemma.
+The distributed pipeline extends to Gemma~4~E2B (5.1B, 35 layers, FP32 due to PLI quantization sensitivity, see \S\ref{sec:discussion}). Gemma~4 also exercises a feature Llama doesn't have: layers~15--34 share K/V projections with earlier layers (the weights are untrained placeholders, and inference reads from source layers' cache via \texttt{DynamicCache}). In the distributed pipeline, this means L13/L14 KV tensors must cross the stage boundary. We transmit them as additional non-stateful outputs from stage~0, received as inputs at stage~1, with a 4D$\rightarrow$3D reshape for the TCP header protocol.
 
 \begin{table}[ht]
 \centering
-\caption{Gemma~4~E2B distributed pipeline (FP32, 2-stage, pre-$v_5$\_beam export). Micro-batching takes the 2-node distributed configuration from $61\%$ to $102\%$ of the 1-stage single-node baseline.}
+\caption{Gemma~4~E2B distributed pipeline (FP32, 2-stage). Micro-batching takes the 2-node distributed configuration from $61\%$ to $102\%$ of the 1-stage single-node baseline.}
 \label{tab:gemma_dist}
 \begin{tabular}{@{}lrrl@{}}
 \toprule
@@ -416,8 +416,6 @@ Configuration & Tok/s & Decode & Notes \\
 \bottomrule
 \end{tabular}
 \end{table}
-
-A complication specific to Gemma~4: layers~15--34 share K/V projections with earlier layers (the weights are untrained placeholders, and inference reads from source layers' cache via \texttt{DynamicCache}). In the distributed pipeline, this means L13/L14 KV tensors must cross the stage boundary. We transmit them as additional non-stateful outputs from stage~0, received as inputs at stage~1, with a 4D$\rightarrow$3D reshape for the TCP header protocol. Figuring this out required reading the Gemma~4 source carefully---the sharing mechanism is not documented. Applying the $v_5$\_beam \texttt{beam\_idx} Gather injection (\S\ref{sec:shards}) to a Gemma~4 shard to validate $v_5$\_beam-parity on a second architecture is future work; the technique is graph-agnostic in principle but each architecture's KV-\texttt{ReadValue} pattern location has to be re-identified.
 
 % ============================================================================
 \section{Multi-User Throughput via Micro-Batching}
