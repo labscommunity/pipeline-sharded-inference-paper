@@ -20,7 +20,7 @@
 \maketitle
 
 \begin{abstract}
-We distribute large language model inference across fleets of commodity Intel AI PCs using pre-compiled pipeline shards. Per-stage INT4 OpenVINO IR subgraphs are exported via \texttt{torch.jit.trace} with precomputed rotary embeddings, producing stateful KV-cached shards chained over TCP. We report three findings. First, the export pipeline produces compiled shards that \emph{outperform} monolithic model inference---by up to 22\% on GPU and 45\% on CPU---because the simplified attention graph and smaller compilation units yield better operator scheduling. Second, a fleet of three Intel AI PCs (Lunar Lake and Panther Lake) achieves 14.73 tokens/second on Llama~3.1~8B, reaching 85\% of single-node throughput over WiFi with 65~ms steady-state decode latency. Third, a micro-batching technique using independent stateful InferRequests improves multi-user throughput by 1.38--1.66$\times$ with no hardware changes. Results are validated across Llama~3.1~8B and Gemma~4~E2B and characterized under simulated WAN conditions from LAN to 200~ms RTT. Code is available at \texttt{[URL]}.
+We distribute large language model inference across fleets of commodity Intel AI PCs using pre-compiled pipeline shards composed with mask-based speculative decoding. Per-stage INT4 OpenVINO IR subgraphs are exported via \texttt{torch.jit.trace} with precomputed rotary embeddings and a post-export \texttt{beam\_idx} Gather injection that unlocks the OpenVINO GPU plugin's \texttt{IndirectKVCache} fusion; the resulting shards run at parity with monolithic inference. On top of the shard pipeline we layer two composing multipliers. First, a \emph{mask-based} KV-cache rewind makes speculative decoding practical on stateful OpenVINO models without paged attention---a 40~ms \texttt{query\_state}/\texttt{set\_state} round-trip per rejected draft is the reason the technique was previously a net loss on Intel iGPUs; masking rejected-draft cache positions via \texttt{attention\_mask}\,=\,0 is bit-exact with physical trim at essentially zero cost and yields 1.35$\times$ mean speedup (1.65$\times$ at 2048 tokens) on a single node. Second, multi-user pipeline micro-batching via independent stateful \texttt{InferRequest}s scales the two-node pipeline 2.03$\times$ in system throughput. Composed end-to-end, a two-node Llama~3.1~8B INT4 pipeline serves two users at 41.25~tok/s---1.89$\times$ the throughput of monolithic single-user inference on the same hardware---and the advantage grows to 4.03$\times$ over naïve distributed decode under 100~ms/hop WAN latency, where the naïve pipeline falls below the interactive threshold. We also document an undocumented OpenVINO runtime failure mode (\texttt{reset\_state()} on multiple \texttt{InferRequest}s sharing one compiled model) and provide a per-stream \texttt{compile\_model} workaround. Code, raw benchmark logs, and reproduction scripts are released at \texttt{[URL]}.
 \end{abstract}
 
 % ============================================================================
@@ -28,23 +28,25 @@ We distribute large language model inference across fleets of commodity Intel AI
 \label{sec:intro}
 % ============================================================================
 
-Modern AI PCs ship with integrated GPUs, NPUs, and 16--32~GB of unified memory, yet spend most of their time idle. A single Intel AI PC runs Llama~3.1~8B at 14--17~tokens/second. A fleet of them, coordinated over a standard office network, could serve LLM inference without cloud dependency---at zero marginal cost, with full data locality.
+Modern AI PCs ship with integrated GPUs, NPUs, and 16--32~GB of unified memory, yet spend most of their time idle. A single Intel AI PC runs Llama~3.1~8B at 22~tokens/second. A fleet of them, coordinated over a standard office network, could serve LLM inference without cloud dependency---at zero marginal cost, with full data locality.
 
-The barrier is software, not hardware. Standard model export tools (\texttt{torch.export}, \texttt{torch.onnx.export}) fail on modern transformer attention due to dynamic control flow in rotary embeddings and KV cache management. Monolithic compiled models cannot be split at layer boundaries without invasive graph surgery. And pipeline parallelism, developed for training throughput~\cite{huang2019gpipe, narayanan2021pipedream}, has seen limited evaluation for autoregressive \emph{inference} on consumer hardware.
+The barrier is software, not hardware. Standard model export tools (\texttt{torch.export}, \texttt{torch.onnx.export}) fail on modern transformer attention due to dynamic control flow in rotary embeddings and KV cache management. Monolithic compiled models cannot be split at layer boundaries without invasive graph surgery. Pipeline parallelism, developed for training throughput~\cite{huang2019gpipe, narayanan2021pipedream}, has seen limited evaluation for autoregressive \emph{inference} on consumer hardware---and when stages are distributed over a real network, each per-token TCP round trip becomes the dominant cost. Speculative decoding~\cite{leviathan2023fast, chen2023accelerating} is the natural answer (amortize network round-trips across multiple tokens emitted per target forward), but the canonical implementations rely on paged attention or dedicated rewind APIs that are not available on stateful OpenVINO models.
 
-We built a system to close these gaps, and in doing so discovered something unexpected: the per-stage compiled shards are not just a means to distribute inference---they are \emph{faster than running the full model on one machine}. A single shard containing all 32 Llama layers, exported through our pipeline but never split, runs 16\% faster on GPU than the same model served through OpenVINO's standard \texttt{LLMPipeline}. Splitting into 2--3 stages pushes the improvement to 22\%.
+We build a distributed-inference stack that closes all three gaps, and the composition produces a surprisingly strong result: a two-node fleet of consumer Intel AI PCs serves two concurrent users at $1.89\times$ the throughput of a single-user monolithic baseline on the same hardware, and under a 100~ms/hop WAN the same configuration stays usable (11.2~tok/s per-user aggregate) while naïve pipeline-parallel decode falls to 2.77~tok/s (unusable).
 
-We make three contributions:
+We make four contributions:
 
 \begin{enumerate}[leftmargin=*]
-  \item \textbf{A per-stage export pipeline} that produces standalone INT4 OpenVINO IR shards from HuggingFace transformer models. The key technique: trace decoder layers with precomputed rotary embeddings and manually constructed KV cache state, sidestepping the dynamic control flow that defeats standard export. The resulting shards are self-contained compiled graphs deployable to any node.
+  \item \textbf{A per-stage export pipeline that produces INT4 OpenVINO IR shards at monolithic parity.} Starting from \texttt{torch.jit.trace} with precomputed rotary embeddings~(\S\ref{sec:export}) and adding a post-export \texttt{beam\_idx} Parameter + \texttt{Gather(ReadValue, beam\_idx, axis=0)} injection that unlocks the OpenVINO GPU plugin's \texttt{IndirectKVCache} transformation~(\S\ref{sec:shards}), the resulting shards reach within $4\%$ of \texttt{openvino\_genai.LLMPipeline} monolithic inference. Earlier iterations of our own export pipeline (pre-\texttt{beam\_idx}) ran $12$--$25\%$ slower; the fusion unlock is the non-trivial part of the pipeline, and we document how we found it.
 
-  \item \textbf{The finding that these shards outperform monolithic inference.} On Llama~3.1~8B, per-stage shards run up to 22\% faster on GPU and 45\% faster on CPU than \texttt{openvino\_genai.LLMPipeline}. The effect is reproducible on Gemma~4~E2B (5.1B parameters). We decompose the speedup: most of it comes from the simplified attention graph (16\% GPU), with an additional gain from splitting into smaller compilation units.
+  \item \textbf{Mask-based KV-cache rewind for speculative decoding on stateful models.} Speculative decoding on an OpenVINO stateful target requires rejecting speculative draft tokens from the KV cache. The natural path---\texttt{query\_state()}/\texttt{set\_state()} physical trim---costs $\sim 40$~ms per call on Arc B390 iGPU (measured; six per step at $K=3$), enough to make speculative decoding a net loss at break-even accept rates. Setting \texttt{attention\_mask[j]\,=\,0} for rejected-draft cache positions is bit-exact with physical trim at essentially zero cost and enables $1.35\times$ mean single-node speedup across eight prompt types, rising to $1.65\times$ at 2048-token generations~(\S\ref{sec:spec}). We document this as Discovery~\#20 in the accompanying repository.
 
-  \item \textbf{Pipeline micro-batching via independent stateful InferRequests.} Each InferRequest carries its own KV cache. Interleaving decode steps from separate user requests across pipeline stages yields 1.38$\times$ throughput on Llama and 1.66$\times$ on Gemma~4~E2B, determined by stage compute asymmetry.
+  \item \textbf{Pipeline micro-batching via independent stateful InferRequests.} Each InferRequest carries its own KV cache. Interleaving decode steps from separate user requests across pipeline stages yields $2.03\times$ system-throughput scaling on our $v_5$\_beam Llama~8B shards (up from $1.38\times$ on our earlier external-rotary export, explainable by the smaller per-stage compute window created by \texttt{IndirectKVCache} fusion)~(\S\ref{sec:microbatch}). We also document an undocumented OpenVINO runtime failure mode---\texttt{reset\_state()} on multiple \texttt{InferRequest}s sharing one compiled model corrupts shape inference with a specific \texttt{Add} broadcast error---and provide a per-stream \texttt{compile\_model} workaround that recovers the advertised independence semantics.
+
+  \item \textbf{Multiplicative composition of all three into a distributed-inference stack that beats monolithic single-user on throughput and beats naïve distributed decode by $4\times$ under WAN.} The $v_5$\_beam shards $\times$ mask-based spec decode $\times$ 2-stream micro-batching on a two-node fleet reaches $41.25$~tok/s ($1.89\times$ monolithic single-user) at LAN and degrades gracefully with simulated hop latency (measured at $0$, $10$, $50$, $100$~ms/hop)~(\S\ref{sec:distributed}). Naïve distributed decode at $100$~ms/hop yields $2.77$~tok/s; our stack yields $11.20$~tok/s.
 \end{enumerate}
 
-The system is evaluated on three Intel AI PCs (two ASUS Zenbook~S~14 with Lunar Lake, one HP OmniBook~X~16 with Panther Lake) connected over WiFi. The distributed pipeline achieves 14.73~tok/s on Llama~3.1~8B (85\% of single-node) and 13.51~tok/s on Gemma~4~E2B via micro-batching---which \emph{exceeds} single-node throughput (13.3~tok/s). We characterize performance under simulated WAN latency and find throughput degrades linearly, remaining interactive ($>$8~tok/s) up to 50~ms RTT.
+The system is evaluated on three Intel AI PCs (two ASUS Zenbook~S~14 with Lunar Lake, one HP OmniBook~X~16 with Panther Lake) connected over WiFi. Results are reproducible: every table row below is backed by a committed benchmark script and raw log in the companion repository.
 
 % ============================================================================
 \section{Background and Related Work}
@@ -57,7 +59,7 @@ Pipeline parallelism partitions a model's layers across devices. GPipe~\cite{hua
 
 Petals~\cite{borzunov2023petals} demonstrated decentralized pipeline inference across volunteer GPUs over the internet, reaching 6~tok/s on Llama~2~70B via DHT-based routing. Parallax~\cite{lin2024parallax} showed pipeline inference on consumer Apple Silicon Macs, reporting 3.1$\times$ latency improvements. MDI-LLM~\cite{wang2025mdillm} proposed recurrent pipeline parallelism for edge devices with up to 74\% throughput gains on four-node systems.
 
-Our work differs in three respects. We pre-compile OpenVINO IR shards rather than partitioning models at runtime, which is what enables the ``shards outperform monolithic'' finding---something none of these systems report. We target Intel AI PC integrated GPUs via OpenVINO rather than NVIDIA or Apple hardware. And we introduce micro-batching for multi-user throughput via independent KV cache state in compiled InferRequests.
+Our work differs in three respects. We pre-compile OpenVINO IR shards with a \texttt{beam\_idx}-Gather graph-surgery pass that unlocks the \texttt{IndirectKVCache} GPU fusion, producing per-stage shards at monolithic parity rather than partitioning models at runtime with graph overhead. We target Intel AI PC integrated GPUs via OpenVINO rather than NVIDIA or Apple hardware. And we introduce mask-based speculative decoding rewind~(\S\ref{sec:spec})---a technique that makes speculative decoding~\cite{leviathan2023fast, chen2023accelerating} pay off on stateful OpenVINO without paged attention---which, stacked with micro-batching, produces the multi-user throughput advantage the paper builds toward.
 
 \subsection{Model Compilation and Export}
 
@@ -108,84 +110,145 @@ Each shard's compiled graph contains ReadValue/Assign ops implementing the KV ca
 For models with cross-layer KV sharing (Gemma~4 shares K/V between layers via \texttt{DynamicCache}), the shared tensors are transmitted as additional stage outputs/inputs over TCP, with a 4D$\rightarrow$3D reshape for the 3-dimension header protocol.
 
 % ============================================================================
-\section{Per-Stage Shards Outperform Monolithic Inference}
+\section{Reaching Monolithic Parity: the beam\_idx Gather Injection}
 \label{sec:shards}
 % ============================================================================
 
-The most unexpected finding of this work: per-stage compiled shards are \emph{faster} than monolithic inference, even when all stages run on a single machine. Distributed inference does not start from a throughput deficit. It starts from a surplus.
+A naive reading of the export pipeline of \S\ref{sec:export} gives a workable but uncompetitive result: on Llama~3.1~8B INT4, a 1-stage shard (all 32~layers in one graph, same weights as the monolithic model, only the export path differs) runs $13$--$23\%$ slower than \texttt{openvino\_genai.LLMPipeline} at steady state. Splitting into more stages makes it worse. The reason is that the OpenVINO GPU plugin contains a plugin-internal transformation, \texttt{IndirectKVCache}, that rewrites \texttt{ReadValue~$\rightarrow$~Concat~$\rightarrow$~Assign} patterns into a fused \texttt{IndirectSDPA} op---but the transformation is gated on the presence of a specific pattern: each KV \texttt{ReadValue}'s output must flow through a \texttt{Gather} indexed by a \texttt{beam\_idx} Parameter (used by beam search in the monolithic \texttt{LLMPipeline} path). Our initial exports did not include that pattern, so the GPU plugin silently fell back to a generic \texttt{KVCacheFusion} path with measurably lower XVE occupancy.
 
-\subsection{Experimental Setup}
-
-We compare five configurations on an HP OmniBook X~16 (Intel Core Ultra X7 358H, Panther Lake, 32~GB DDR5) running Llama~3.1~8B Instruct:
-
-\begin{enumerate}[leftmargin=*]
-  \item \textbf{Monolithic INT4} via \texttt{openvino\_genai.LLMPipeline}---the standard single-graph compiled model with built-in KV cache.
-  \item \textbf{1-stage shard}---all 32 layers exported through our pipeline as one compiled graph with stateful KV cache. Isolates the export pipeline effect from graph splitting.
-  \item \textbf{2-stage shards}---layers 0--15 and 16--31, chained in-process.
-  \item \textbf{3-stage shards}---layers 0--10, 11--21, and 22--31.
-  \item \textbf{4-stage shards}---layers 0--7, 8--15, 16--23, and 24--31.
-\end{enumerate}
-
-All use INT4 symmetric quantization (group size~128), GPU execution, 20~tokens from a standardized prompt set. The monolithic model uses \texttt{openvino\_genai}'s built-in KV cache; shards use stateful ReadValue/Assign.
+The fix is post-export graph surgery: after \texttt{apply\_make\_stateful\_transformation}, walk the graph, add a \texttt{beam\_idx: [-1] i32} Parameter, and for each KV \texttt{ReadValue} insert a \texttt{Gather(ReadValue,~beam\_idx,~axis=0)} between the ReadValue output and its downstream consumers. This is exactly what \texttt{optimum-intel}'s internal \texttt{fuse\_cache\_reorder} pass does for monolithic exports, lifted out and applied to our per-stage exports. We call the resulting shards $v_5$\_beam.
 
 \subsection{Results}
 
 \begin{table}[ht]
 \centering
-\caption{Single-node throughput: monolithic vs.\ per-stage shards, Llama~3.1~8B INT4, Panther Lake GPU. The 1-stage shard---same model, same layers, different export path---is already 16\% faster.}
-\label{tab:shard_vs_mono}
+\caption{Single-node Llama~3.1~8B INT4 on Panther Lake Arc B390 iGPU, $N\!=\!5$ paired runs, same session, controlled-tokenization 128-token decode. $v_5$\_beam closes the export-to-monolithic gap from $-10$ to within $4\%$ of \texttt{openvino\_genai}.}
+\label{tab:shard_parity}
 \begin{tabular}{@{}lrrr@{}}
 \toprule
-Configuration & GPU tok/s & CPU tok/s & GPU vs.\ Mono \\
+Configuration & Tok/s & Range & vs.\ A \\
 \midrule
-Monolithic INT4 (\texttt{LLMPipeline}) & 13.8 & 4.7 & 1.00$\times$ \\
-1-stage shard (our export) & 16.0 & 8.1 & 1.16$\times$ \\
-2-stage shards & 16.8 & 6.8 & 1.22$\times$ \\
-3-stage shards & 16.8 & 6.8 & 1.22$\times$ \\
-4-stage shards & 15.4 & 5.9 & 1.12$\times$ \\
+A: mono \texttt{openvino\_genai} (C++ loop)       & 22.96 & 21.71--23.65 & 1.00$\times$ \\
+A$'$: mono \texttt{ov.compile\_model} (our Python loop) & 20.61 & 20.09--21.83 & 0.90$\times$ \\
+B ($v_5$\_beam 1-stage, our export)               & 22.08 & 21.66--22.63 & 0.96$\times$ \\
+B$_{v_3\_fp32}$ (pre-\texttt{beam\_idx})          & 20.05 & 19.74--20.34 & 0.87$\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The 1-stage shard---without any graph splitting---gains 16\% on GPU and 72\% on CPU over the monolithic model (Table~\ref{tab:shard_vs_mono}). This isolates the export pipeline effect: precomputed rotary embeddings and manual attention produce a simpler graph that the OpenVINO compiler handles better.
+The \texttt{beam\_idx} Gather injection recovers $10\%$ of throughput (from $20.05$ to $22.08$~tok/s) without touching the weights, tokenization, or decode loop. The remaining $4\%$ gap between B ($v_5$\_beam) and A is explained by \texttt{openvino\_genai}'s C++ decode loop vs.\ our Python loop: the A$'$~vs.\ A comparison, which holds the compiled graph fixed and varies only the decode-loop language, shows a $10\%$ Python overhead. After accounting for that, B~is $7\%$ \emph{faster} than A$'$ on the same paired measurement.
 
-Splitting into 2 or 3 stages adds another 5\% on GPU (16.0$\rightarrow$16.8~tok/s). At 4 stages, per-graph dispatch overhead erodes the gain (16.8$\rightarrow$15.4). The sweet spot is 2--3 stages.
-
-The CPU improvement is particularly striking. Our 1-stage shard reaches 8.1~tok/s versus 4.7~tok/s monolithic---a 72\% gain. CPU execution is more memory-bandwidth-constrained, so the tighter data access patterns of the manually-exported graph have outsized impact.
-
-\subsection{Cross-Architecture Validation}
-
-We replicate this on Gemma~4~E2B (5.1B parameters, 35 layers). Gemma~4's per-layer input embeddings are quantization-sensitive (Section~\ref{sec:discussion}), so the comparison uses FP32:
+\subsection{Splitting into More Stages}
 
 \begin{table}[ht]
 \centering
-\caption{Gemma~4~E2B single-node (Panther Lake GPU, FP32). The pattern holds: compiled shards match or exceed monolithic.}
-\label{tab:gemma_shard}
+\caption{$v_5$\_beam shards, 2-stage and 3-stage, in-process on Panther Lake iGPU. The parity extends through splitting at the cost of $\sim 1$~tok/s per additional stage from Python activation passing and smaller per-stage XVE problem sizes.}
+\label{tab:shard_stages}
 \begin{tabular}{@{}lrr@{}}
 \toprule
-Configuration & GPU tok/s & Decode latency \\
+Configuration & Tok/s & vs.\ mono (A) \\
 \midrule
-1-stage KV-cached & 13.3 & 68~ms \\
-2-stage localhost GPU$\rightarrow$GPU & 12.1 & 71~ms \\
-2-stage multi-node GPU$\rightarrow$GPU & 8.12 & 96~ms \\
+Mono (A, reference) & 21.79 & 1.00$\times$ \\
+$v_5$\_beam, 1-stage      & 22.08 & 0.96$\times$ \\
+$v_5$\_beam, 2-stage (16+16) & 19.41 & 0.89$\times$ \\
+$v_5$\_beam, 3-stage (11+11+10) & 19.79 & 0.91$\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The 2-stage localhost configuration reaches 91\% of single-node throughput, with only 3~ms additional decode latency from in-process graph dispatch.
+Per-stage splitting costs $\sim$9--11\% on a single machine; the per-stage GEMMs are smaller, reducing XVE occupancy (measured $60.1\%$ on mono vs.\ $43.6\%$ on 3-stage via VTune \texttt{gpu-hotspots}, with identical top-kernel counts), and the Python-level \texttt{hidden\_states.astype(np.float32)} cast between stages is not free. This gap is structural: smaller per-stage problems cannot saturate the GPU the way a single large problem does. We return to how to recover this cost (and then some) via multi-user micro-batching in~\S\ref{sec:microbatch} and via speculative decoding in~\S\ref{sec:spec}.
 
-\subsection{Analysis}
-\label{sec:shard_analysis}
+\subsection{Earlier Benchmark Methodology Error}
 
-Three factors likely contribute:
+An earlier iteration of this work reported $16$--$22\%$ \emph{speedups} of our sharded pipeline over monolithic inference, with $45\%$ on CPU. That result did not hold up under controlled methodology. The original benchmark scripts used different tokenization for the monolithic path (chat template auto-applied, $\text{seq\_len}\!=\!42$) versus the sharded path (raw prompt, $\text{seq\_len}\!=\!7$), and had an insufficient first-token GPU-compile warmup that inflated the monolithic per-token time when the model terminated at EOS after only 7 tokens. A controlled paired bench with identical \texttt{input\_ids}, identical \texttt{max\_new\_tokens}~=~128 and \texttt{ignore\_eos=True}, $N\!=\!5$ runs after 2 warmups shows monolithic at $22$--$24$~tok/s and sharded at $17$--$20$~tok/s (Table~\ref{tab:shard_parity}). The \texttt{beam\_idx} Gather injection closes the remaining gap.
 
-\textbf{Simplified attention graph.} Precomputing rotary embeddings and replacing \texttt{DynamicCache} with explicit stateful tensors removes operations and simplifies data dependencies. The OpenVINO compiler can fuse more aggressively over a simpler graph. We believe this is the primary factor, given that the 1-stage shard (same total computation, fewer ops) captures most of the speedup.
+This investigation is the reason we can confidently write Table~\ref{tab:shard_parity}: the numbers are from one paired session using identical tokenization and identical decode loops except where noted. The replication commits, raw JSON, and VTune summary reports are in the companion repository.
 
-\textbf{Cache locality.} The monolithic INT4 model is 4.1~GB; a 2-stage shard is 1.3--1.8~GB. On the Panther Lake SoC, smaller working sets may keep more weight tensors in cache. This is consistent with the 72\% CPU gain, where memory bandwidth is the tighter constraint.
+% ============================================================================
+\section{Speculative Decoding via Mask-Based KV Rewind}
+\label{sec:spec}
+% ============================================================================
 
-\textbf{Compilation scope.} Smaller graphs have fewer scheduling constraints, potentially allowing more efficient tiling and kernel selection. The throughput peak at 2--3 stages and decline at 4 stages supports this: at some point, per-graph dispatch overhead outweighs the compilation benefit.
+Speculative decoding~\cite{leviathan2023fast, chen2023accelerating} amortizes target-model forward passes over multiple emitted tokens: a smaller draft model proposes $K$ tokens, the target verifies all $K$ in one forward pass, and accepted prefixes are emitted together. On a distributed pipeline this is doubly attractive---it amortizes not only target compute but also network round-trips. On a \emph{single} node, the technique's per-step cost structure determines whether it pays off at all.
 
-We plan to confirm these hypotheses with VTune Microarchitecture Exploration profiling comparing L3 cache behavior across workloads.
+\subsection{The Trim Problem}
+
+Standard speculative decoding rejects draft tokens whose predictions do not match the target's. On an OpenVINO stateful model, rejecting tokens means removing their K and V contributions from the KV cache before the next target forward. The natural API for this is \texttt{InferRequest.query\_state()} (returns a list of the per-layer state tensors) followed by assigning a sliced tensor back to each state via \texttt{sv.state~=~ov.Tensor(sliced\_np)}. We measured this on Llama~3.1~8B INT4 on Arc B390:
+
+\begin{table}[ht]
+\centering
+\caption{Per-call cost of physical KV trim on Arc B390 iGPU with a 72-token cache (32 layers, 64 state tensors). All three variants cluster around $45$--$50$~ms; the cost is device-side state invalidation, not numpy work.}
+\label{tab:trim_cost}
+\begin{tabular}{@{}lr@{}}
+\toprule
+\texttt{trim\_kv} variant & ms/call \\
+\midrule
+\texttt{np.asarray(sv.state.data)} + slice + new Tensor & 49.5 \\
+In-place \texttt{Tensor.set\_shape()} & 46.6 \\
+\texttt{ov.Tensor} allocate + \texttt{np.asarray(new)[:]} & 49.9 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A $K\!=\!3$ speculative step executes one target verify ($\sim 47$~ms memory-bound forward of $K\!+\!1\!=\!4$ tokens), 2--3 draft feeds ($\sim 16$~ms each), and one correction feed ($\sim 16$~ms). At roughly 3 emitted tokens per step, a $\sim 45$~ms trim per step is enough to push the whole technique below break-even.
+
+\subsection{Mask-Based Rewind}
+
+Our alternative avoids state manipulation entirely. The OpenVINO stateful model takes \texttt{attention\_mask} as a per-forward input of shape $[\mathrm{batch},\,\mathrm{past\_len}+\mathrm{input\_len}]$, where \texttt{mask[j]=0} means ``ignore cache position $j$ in attention.'' If rejected-draft tokens remain physically in the cache but their positions are masked out on every subsequent forward, the attention result is identical to a physically-trimmed cache. Future tokens' key and value tensors append at the next cache index, with RoPE computed from the caller-supplied \texttt{position\_ids}; as long as \texttt{position\_ids} tracks the \emph{logical} sequence length (the pre-rewind count) rather than the physical cache length, the rotary rotations are coherent.
+
+We verified this is bit-exact with physical trim. Running both paths side-by-side on the same target--prompt--draft--correction sequence (script \texttt{mask\_trim\_test.py} in the companion repo), the maximum absolute difference in post-correction logits was $0.0000$ (fp32 equality to machine precision).
+
+The cost is CPU-only: each forward reconstructs the $[1, \mathrm{past\_len}+\mathrm{input\_len}]$ mask by concatenating a tracked \texttt{valid\_mask} prefix with ones for the new tokens. Measured: $<\,1\%$ of per-step wall time at $K\!=\!3$. The memory cost is that rejected-draft K and V entries persist in cache, inflating cache size over generations. At 2048-token generation with $K\!=\!3$, cache bloat reaches $1.02\times$ logical length (most rejected-draft overhead is amortized out by the live-token count), so no periodic compaction is needed for realistic single-turn lengths.
+
+\subsection{Single-Node Results}
+
+\begin{table}[ht]
+\centering
+\caption{Speculative decoding on Llama~3.1~8B INT4 (target) + Llama~3.2~1B INT4 (draft) on Arc B390 iGPU, greedy decode, bit-exact output vs.\ target-only greedy. Eight diverse prompts, 128-token decode, $K\!=\!3$, mean $\pm$ stddev.}
+\label{tab:spec_lan}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Prompt category & Baseline (tok/s) & Spec (tok/s) & Speedup \\
+\midrule
+short-factual    & 22.08 & 28.75 & 1.30$\times$ \\
+reasoning        & 20.60 & 27.27 & 1.32$\times$ \\
+code-completion  & 19.98 & 32.71 & 1.64$\times$ \\
+list-enumeration & 21.10 & 28.54 & 1.35$\times$ \\
+creative         & 22.10 & 24.53 & 1.11$\times$ \\
+technical-expl   & 21.98 & 27.12 & 1.23$\times$ \\
+chat-assistant   & 21.96 & 30.73 & 1.40$\times$ \\
+translation      & 22.15 & 31.93 & 1.44$\times$ \\
+\midrule
+\textbf{Mean}    & \textbf{21.49} & \textbf{28.95} & \textbf{1.35$\times$ $\pm$ 0.15} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Speedup varies from $1.11\times$ (creative writing, 49.7\% accept rate) to $1.64\times$ (code completion, 93.1\% accept rate). On content that is easier for the draft to predict (structured output: code, translation, chat boilerplate), the speedup climbs toward the theoretical $1\!+\!K\!\cdot\!p_\text{accept}$ ceiling; on content where the draft diverges early, it falls to the acceptance floor. Every prompt produces output that is bit-exact identical to the target's own greedy decode on the first ten generated tokens (the companion repo's smoke test verifies full-sequence equality).
+
+Generation length amplifies the effect: across 128, 256, 1024, and 2048-token runs on the \emph{same} prompt, acceptance rises from $70.7\%$ to $97.5\%$ as the model enters its repetition regime, and speedup at $K\!=\!3$ climbs from $1.35\times$ to $1.65\times$.
+
+\subsection{Compose-with-Shards}
+
+Because the rewind lives at the Python wrapper layer---not inside the compiled OV graph---the same \texttt{MaskedReq} abstraction composes with both the monolithic target and our $v_5$\_beam 3-stage sharded target. Measured in a single paired session (\texttt{bench\_spec\_matrix.py}):
+
+\begin{table}[ht]
+\centering
+\caption{Speculative decoding stacks cleanly with sharding. Single-session paired measurement, $K\!=\!3$, 128-token decode.}
+\label{tab:spec_shard}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Target & Tok/s & vs.\ mono-A & vs.\ own baseline \\
+\midrule
+Mono (A) & 21.79 & 1.00$\times$ & --- \\
+3-stage $v_5$\_beam shard (B) & 19.79 & 0.91$\times$ & --- \\
+Mono + spec $K\!=\!3$ & 28.28 & 1.30$\times$ & 1.30$\times$ \\
+3-stage shard + spec $K\!=\!3$ & 26.28 & 1.21$\times$ & 1.33$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The spec-decode multiplier is essentially the same ($1.30\times$ vs.\ $1.33\times$) on both paths. Output is bit-exact: the mono-plus-spec output matches the mono-only output, and the shard-plus-spec output matches the shard-only output.
 
 % ============================================================================
 \section{Distributed Pipeline Evaluation}
@@ -197,57 +260,60 @@ We plan to confirm these hypotheses with VTune Microarchitecture Exploration pro
 Three Intel AI PCs on the same WiFi network (802.11ax):
 
 \begin{itemize}[leftmargin=*]
-  \item \textbf{node-00} (ASUS Zenbook S 14): Core Ultra 7 258V (Lunar Lake), 32~GB LPDDR5X.
-  \item \textbf{node-01} (ASUS Zenbook S 14): Core Ultra 7 258V (Lunar Lake), 32~GB LPDDR5X.
-  \item \textbf{node-02} (HP OmniBook X 16): Core Ultra X7 358H (Panther Lake), 32~GB DDR5.
+  \item \textbf{node-00} (\emph{beta}, ASUS Zenbook S 14): Core Ultra 7 258V (Lunar Lake), Arc 140V iGPU, 32~GB LPDDR5X-8533.
+  \item \textbf{node-01} (\emph{charlie}, ASUS Zenbook S 14): Core Ultra 7 258V (Lunar Lake), Arc 140V iGPU, 32~GB LPDDR5X-8533.
+  \item \textbf{node-02} (\emph{alpha}, HP OmniBook X 16): Core Ultra X7 358H (Panther Lake), Arc B390 iGPU, 32~GB DDR5.
 \end{itemize}
 
-All run Windows~11, Python~3.11, OpenVINO~2026.0, GPU inference. Raw TCP round-trip for 16~KB payloads: 6.5~ms (measured separately).
+All run Windows~11, Python~3.11, OpenVINO~2026.1.0, GPU inference. Raw TCP round-trip for 16~KB payloads: 6.5~ms on the 802.11ax LAN (measured separately).
 
 \subsection{Progressive Optimization}
 
 \begin{table}[ht]
 \centering
-\caption{Llama~3.1~8B distributed throughput, building up from a naive baseline. Cumulative improvement: 4.69$\times$.}
+\caption{Llama~3.1~8B INT4 distributed throughput on the 2-node \emph{alpha} + \emph{charlie} $v_5$\_beam pipeline, building up from the single-stream distributed baseline. System throughput for multi-user is aggregated across concurrent streams. All configurations produce bit-exact output relative to target-only greedy.}
 \label{tab:progression}
-\begin{tabular}{@{}lrrrl@{}}
+\begin{tabular}{@{}lrrr@{}}
 \toprule
-Configuration & Tok/s & Decode & vs.\ single-node & Key change \\
+Configuration & Tok/s & vs.\ mono-A & vs.\ single-stream dist. \\
 \midrule
-3-stage non-cached & 3.14 & $\sim$120~ms & 19\% & Baseline \\
-3-stage KV-cached & 10.47 & 83~ms & 62\% & +KV cache \\
-2-stage KV-cached & \textbf{14.73} & \textbf{65~ms} & \textbf{85\%} & $-$1 TCP hop \\
-\midrule
-Single-node baseline & 17.4 & 54~ms & 100\% & No network \\
+Mono single-node reference (A) & 21.79 & 1.00$\times$ & --- \\
+2-stage $v_5$\_beam, single stream (\emph{alpha}+\emph{charlie}) & 14.51 & 0.67$\times$ & 1.00$\times$ \\
+\,+ 2-stream micro-batching (\S\ref{sec:microbatch}) & 29.46 & 1.35$\times$ & 2.03$\times$ \\
+\,+ mask-based spec decode $K\!=\!3$ (\S\ref{sec:spec}) & \textbf{41.25} & \textbf{1.89$\times$} & \textbf{2.84$\times$} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\textbf{KV cache (3.33$\times$).} Without KV cache, each decode step sends the full growing sequence as hidden states: at sequence length~28, that is $28 \times 4096 \times 4 = 459$~KB per hop. With KV cache, decode sends $1 \times 4096 \times 4 = 16$~KB. The throughput gain reflects both reduced payload and the elimination of sequence-length-dependent recomputation.
+Starting from the 2-node $v_5$\_beam pipeline at $14.51$~tok/s (paying $\sim 17$~ms of TCP round-trip per token vs.\ the $21.79$~tok/s single-node mono reference), two composable multipliers stack multiplicatively:
 
-\textbf{Reducing from 3 to 2 stages (1.41$\times$).} One fewer TCP hop saves 18~ms per token (83$\rightarrow$65~ms). The 2-stage topology is optimal for this testbed---matching its throughput with 3 stages would require sub-9~ms per-hop latency, which is near the WiFi RTT floor.
+\textbf{Micro-batching ($2.03\times$).} Two independent \texttt{InferRequest}s per shard let the coordinator interleave stage-0 compute for request~B while stage~1 is busy with request~A. Our $v_5$\_beam micro-batch multiplier ($2.03\times$) is substantially higher than the $1.38\times$ we measured on the earlier external-rotary shards (\S\ref{sec:microbatch_compare}), explainable by the smaller per-stage compute window that \texttt{IndirectKVCache} fusion leaves behind---more idle time for the other stream to fill.
+
+\textbf{Mask-based spec decode ($1.40\times$ on top).} Each of the two streams runs its own speculative decoding loop (\S\ref{sec:spec}). The $K\!+\!1$-token target verify batches four tokens per TCP round-trip and amortizes the per-hop latency. Applied atop the two-stream pipeline, this yields a further $1.40\times$ multiplier, for a system-throughput total of $41.25$~tok/s: $1.89\times$ the monolithic single-user reference on the same hardware, two users served concurrently.
+
+Composition is empirical, not a projection: $14.51 \times 2.03 \times 1.40 = 41.25$, and all three multipliers were measured in the same paired session (\texttt{scripts/mini\_coord\_spec\_mbatch.py}).
 
 \subsection{Per-Token Breakdown}
 
 \begin{table}[ht]
 \centering
-\caption{Where the time goes: 2-stage distributed pipeline, Llama~3.1~8B, GPU--GPU, WiFi.}
+\caption{Where the time goes: 2-stage $v_5$\_beam Llama~3.1~8B distributed pipeline on the \emph{alpha}+\emph{charlie} 802.11ax WiFi LAN, GPU--GPU, single stream (no spec decode, no micro-batching). Compute numbers averaged across N=3 timed runs.}
 \label{tab:breakdown}
 \begin{tabular}{@{}lrr@{}}
 \toprule
 Component & Time & \% of token \\
 \midrule
-Stage~0 compute (coordinator) & 25~ms & 38\% \\
-Stage~1 compute (worker) & 25~ms & 38\% \\
-TCP round trip (WiFi) & 6~ms & 9\% \\
-Python/numpy overhead & 9~ms & 14\% \\
+Stage~0 compute (coordinator, \emph{alpha} Panther Lake) & 23~ms & 34\% \\
+Stage~1 compute (worker, \emph{charlie} Lunar Lake) & 25~ms & 36\% \\
+TCP round trip (single hop, 802.11ax) & 6~ms & 9\% \\
+Python activation passing + mask construction & 15~ms & 21\% \\
 \midrule
-\textbf{Total} & \textbf{65~ms} & $\rightarrow$ \textbf{15.4~tok/s} \\
+\textbf{Total} & \textbf{69~ms} & $\rightarrow$ \textbf{14.51~tok/s} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-An important subtlety: our initial instrumentation reported ``70\% network time,'' but that metric conflated actual TCP latency with the time spent waiting for the remote worker to compute. Dedicated TCP benchmarking revealed the true network cost is 6.5~ms per round trip (9\% of per-token time). The rest is compute and Python overhead.
+An important subtlety: our initial instrumentation reported ``70\% network time,'' but that metric conflated actual TCP latency with the time spent waiting for the remote worker to compute. Dedicated TCP benchmarking revealed the true network cost is $6.5$~ms per round trip ($9\%$ of per-token time). The rest is compute and Python overhead (the latter is OpenVINO's C++ dispatch and state management, not user Python---a dedicated profile run (\texttt{bench\_feed\_overhead.py}) finds user Python is $0.6\%$ of wall time).
 
 \subsection{Activation Compression}
 
@@ -266,49 +332,77 @@ INT8 & 4~KB & 15.10 & 63--68~ms & Corrupted \\
 \end{tabular}
 \end{table}
 
-At gigabit WiFi, 16~KB transmits in under 0.2~ms. The 35~ms per-hop overhead is TCP kernel scheduling and round-trip time, not bandwidth. Halving the payload gains nothing. INT8 symmetric quantization of the 4096-dim hidden state corrupts generation---``What is the capital of France?'' yields ``1.\ Paris 2.\ London 3.\ Berlin 4.\ Rome.'' Per-channel or group quantization might preserve quality but was not tested. Activation compression is only relevant under bandwidth-constrained WAN conditions.
+At gigabit WiFi, 16~KB transmits in under $0.2$~ms. The $\sim 6.5$~ms per-hop latency is TCP kernel scheduling and round-trip time, not bandwidth. Halving the payload gains nothing. INT8 symmetric quantization of the 4096-dim hidden state corrupts generation---``What is the capital of France?'' yields ``1.\ Paris 2.\ London 3.\ Berlin 4.\ Rome.'' Per-channel or group quantization might preserve quality but was not tested. Activation compression is only relevant under bandwidth-constrained WAN conditions.
 
 \subsection{WAN Latency Sensitivity}
+\label{sec:wan}
 
-We inject one-way latency on all nodes (RTT~=~$2\times$ injected):
+We inject one-way latency on the worker node's \texttt{recv()} and \texttt{send()} boundaries (so added per-target-forward RTT~$\approx 2 \times$ injected), sweeping across LAN-to-intercontinental values. Unlike traditional \texttt{tc/netem} WAN emulation, this approach is deterministic but lacks real TCP effects like slow-start or jitter---the reported speedups should be considered a lower bound on the real WAN advantage (real TCP congestion control amortizes multiple in-flight small messages; the sleep-sim serializes them).
 
 \begin{table}[ht]
 \centering
-\caption{Throughput vs.\ simulated WAN latency, 2-stage KV-cached Llama~3.1~8B. The relationship is linear: each 10~ms of RTT costs $\sim$1.2~tok/s.}
+\caption{Full-stack Llama~3.1~8B throughput vs.\ simulated hop latency, 2-stage $v_5$\_beam pipeline, 2 concurrent streams with spec decode $K\!=\!3$. Naïve single-stream distributed decode (no mbatch, no spec) shown as baseline. At $100$~ms/hop the naïve path falls below the interactive floor while the full stack remains usable.}
 \label{tab:wan}
-\begin{tabular}{@{}lrrl@{}}
+\begin{tabular}{@{}lrrrr@{}}
 \toprule
-Simulated RTT & Tok/s & vs.\ LAN & Typical scenario \\
+Hop latency (ms) & Naïve baseline & Full stack (agg) & Per-stream & Full / naïve \\
 \midrule
-$\sim$0~ms (LAN) & 14.45 & 100\% & Office network \\
-10~ms & 12.13 & 84\% & Same-city DC \\
-30~ms & 9.56 & 66\% & Cross-region \\
-50~ms & 8.10 & 56\% & Residential fiber \\
-100~ms & 5.70 & 39\% & Cable / mobile \\
-200~ms & 3.62 & 25\% & Degraded / intl. \\
+0 (LAN)  & 14.51 & 41.01 & 20.5 & 2.83$\times$ \\
+10       &  9.89 & 37.35 & 18.7 & 3.78$\times$ \\
+50       &  4.72 & 18.25 &  9.1 & 3.87$\times$ \\
+100      &  2.77 & 11.20 &  5.6 & \textbf{4.04$\times$} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The linearity is nearly perfect: per-token time~$=$~compute~($\sim$25~ms)~+~base overhead~($\sim$35~ms)~+~injected RTT. Interactive chat ($>$8~tok/s) is viable up to $\sim$50~ms RTT---residential fiber or same-city connections.
+The advantage over naïve distributed decode \emph{grows} with hop latency. At LAN the full-stack multiplier is $2.83\times$ naïve; at $100$~ms/hop it is $4.04\times$. This is the core benefit of layering speculative decoding onto a distributed pipeline: each target round-trip emits $K+1$ tokens, so per-token network overhead amortizes $1\!+\!p_\text{accept}\!\cdot\!K$ times. For our measured $K\!=\!3$ with $p_\text{accept}\!=\!0.707$, the asymptotic ceiling is $3.1\times$ over naïve; at $100$~ms/hop we approach that ceiling closely because the TCP RTT dominates compute.
 
-\subsection{Long Generation and Stability}
-
-Decode latency remains flat over extended generations on the 2-stage distributed pipeline:
-
-\begin{itemize}[leftmargin=*]
-  \item 200 tokens: 15.95~tok/s, 62~ms decode, no degradation.
-  \item 1{,}000 tokens: 15.55~tok/s sustained, zero KV cache performance loss.
-  \item 10 consecutive prompts (persistent pipeline): 14.46~tok/s aggregate, 0.72~QPS. KV cache reset averages 36~ms between prompts.
-\end{itemize}
-
-\subsection{Gemma 4 E2B Distributed Results}
-
-The distributed pipeline extends to Gemma~4~E2B (5.1B, 35 layers, FP32):
+Choosing the right $K$ per latency regime matters. A separate sweep (Table~\ref{tab:k_sweep}) finds that LAN prefers small~$K$ (2--3) where acceptance is high; $100$~ms/hop prefers large~$K$ (10) where batching enough tokens per round-trip dominates.
 
 \begin{table}[ht]
 \centering
-\caption{Gemma~4~E2B distributed pipeline (FP32, 2-stage). Micro-batching exceeds single-node throughput.}
+\caption{$K$-sweep on the 2-stage $v_5$\_beam pipeline at LAN and $50$~ms/hop simulated. $K\!=\!2$ wins LAN (high per-draft acceptance, cheap draft); $K\!=\!10$ wins under WAN where per-call latency dominates.}
+\label{tab:k_sweep}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+$K$ & LAN agg & LAN accept & 50~ms/hop agg & 50~ms accept \\
+\midrule
+2  & \textbf{44.34} & 84.2\% & --- & --- \\
+3  & 40.48 & 70.7\% & 11.16 & 70.7\% \\
+5  & 40.25 & 67.1\% & 13.75 & 67.1\% \\
+7  & 38.14 & 58.9\% & 15.03 & 58.9\% \\
+10 & 35.42 & 52.5\% & \textbf{15.57} & 52.5\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The LAN-$K$ and WAN-$K$ rows of Table~\ref{tab:k_sweep} give two distinct operating regimes:
+
+\textit{LAN / cloud-adjacent.} Compute dominates. $K\!=\!2$ achieves $44.34$~tok/s ($2.03\times$ monolithic single-user) with $84.2\%$ acceptance---small drafts rarely diverge, large drafts waste the extra draft feeds.
+
+\textit{Regional-to-intercontinental WAN.} Network dominates. $K\!=\!10$ at $50$~ms/hop achieves $15.57$~tok/s ($\sim 3.3\times$ over naïve $4.72$~tok/s at the same hop latency), and at $100$~ms/hop reaches the $4\times$ advantage quoted above.
+
+\subsection{Long Generation and Stability}
+
+Decode latency remains flat over extended generations. On the single-node monolithic baseline, throughput actually \emph{improves} with generation length---speculative decoding's acceptance rate rises as the model enters more predictable continuation patterns:
+
+\begin{itemize}[leftmargin=*]
+  \item $128$ tokens: $1.35\times$ spec speedup, $70.7\%$ acceptance at $K\!=\!3$ (mean across 8 prompts).
+  \item $512$ tokens: $1.56\times$ speedup, $90.6\%$ acceptance.
+  \item $1{,}024$ tokens: $1.59\times$ speedup, $95.1\%$ acceptance.
+  \item $2{,}048$ tokens: $1.65\times$ speedup, $97.5\%$ acceptance, cache bloat ratio $1.02\times$ (the mask-based rewind leaves rejected-draft K/V in physical cache, but rejected-draft overhead is per-step constant while the live-token count grows linearly---bloat ratio converges to 1).
+\end{itemize}
+
+On the 2-stage distributed pipeline (single-stream, no spec), earlier measurements on an extended-prompt workload showed no per-token degradation across $200$ tokens ($15.95$~tok/s), $1000$ tokens ($15.55$~tok/s), and 10 consecutive prompts ($14.46$~tok/s aggregate, $0.72$~QPS, with $36$~ms KV-cache reset between prompts). Those numbers predate $v_5$\_beam; we have not re-measured sustained long-generation on the full stack.
+
+\subsection{Gemma 4 E2B: A Second Architecture}
+\label{sec:gemma}
+
+The distributed pipeline extends to Gemma~4~E2B (5.1B, 35 layers). The Gemma~4 results here use the \emph{earlier} external-rotary export pipeline (not $v_5$\_beam), since Gemma~4 has architecture-specific features---cross-layer K/V sharing via \texttt{DynamicCache} and a large Per-Layer-Input embedding matrix that is quantization-sensitive (\S\ref{sec:discussion})---that the $v_5$\_beam exporter does not yet handle. The table therefore validates that the 2-stage distributed pipeline + micro-batching mechanism reproduces on a different architecture; it does not re-evaluate the $v_5$\_beam parity claim on Gemma.
+
+\begin{table}[ht]
+\centering
+\caption{Gemma~4~E2B distributed pipeline (FP32, 2-stage, pre-$v_5$\_beam export). Micro-batching takes the 2-node distributed configuration from $61\%$ to $102\%$ of the 1-stage single-node baseline.}
 \label{tab:gemma_dist}
 \begin{tabular}{@{}lrrl@{}}
 \toprule
@@ -323,7 +417,7 @@ Configuration & Tok/s & Decode & Notes \\
 \end{tabular}
 \end{table}
 
-A complication specific to Gemma~4: layers~15--34 share K/V projections with earlier layers (the weights are untrained placeholders, and inference reads from source layers' cache via \texttt{DynamicCache}). In the distributed pipeline, this means L13/L14 KV tensors must cross the stage boundary. We transmit them as additional non-stateful outputs from stage~0, received as inputs at stage~1, with a 4D$\rightarrow$3D reshape for the TCP header protocol. Figuring this out required reading the Gemma~4 source carefully---the sharing mechanism is not documented.
+A complication specific to Gemma~4: layers~15--34 share K/V projections with earlier layers (the weights are untrained placeholders, and inference reads from source layers' cache via \texttt{DynamicCache}). In the distributed pipeline, this means L13/L14 KV tensors must cross the stage boundary. We transmit them as additional non-stateful outputs from stage~0, received as inputs at stage~1, with a 4D$\rightarrow$3D reshape for the TCP header protocol. Figuring this out required reading the Gemma~4 source carefully---the sharing mechanism is not documented. Applying the $v_5$\_beam \texttt{beam\_idx} Gather injection (\S\ref{sec:shards}) to a Gemma~4 shard to validate $v_5$\_beam-parity on a second architecture is future work; the technique is graph-agnostic in principle but each architecture's KV-\texttt{ReadValue} pattern location has to be re-identified.
 
 % ============================================================================
 \section{Multi-User Throughput via Micro-Batching}
@@ -334,7 +428,7 @@ A 2-stage pipeline has an inherent inefficiency for single requests: while stage
 
 \subsection{Approach}
 
-Each OpenVINO InferRequest maintains independent KV cache state. Creating two InferRequests per shard---each with its own cache---lets us interleave two user requests:
+Each OpenVINO InferRequest \emph{should}, per the Model API documentation, maintain independent KV cache state. Creating two InferRequests per shard---each with its own cache---lets us interleave two user requests:
 
 \begin{enumerate}[leftmargin=*]
   \item Stage~1 processes request~A's token; simultaneously, stage~0 processes request~B's token.
@@ -342,29 +436,45 @@ Each OpenVINO InferRequest maintains independent KV cache state. Creating two In
   \item Repeat. The pipeline alternates, filling bubbles.
 \end{enumerate}
 
-No changes to the compiled model, memory management, or relay protocol. The coordinator maintains two generation states and alternates which one it advances.
+\subsection{An undocumented OpenVINO constraint}
+\label{sec:ov_bug}
+
+In practice, OpenVINO~2026.1 and~2026.2 contain an undocumented failure mode: calling \texttt{reset\_state()} on one \texttt{InferRequest} among several created from the \emph{same} \texttt{CompiledModel} causes subsequent \texttt{infer()} calls on any of the sibling requests to fail with:
+
+\begin{verbatim}
+Check 'TRShape::broadcast_merge_into(...)' failed at
+  src/core/shape_inference/include/eltwise_shape_inference.hpp:28:
+While validating node 'opset1::Add Add_NNN () -> ()':
+Argument shapes are inconsistent.
+\end{verbatim}
+
+The specific \texttt{Add\_NNN} node varies between runs and models; consistently, it is an \texttt{opset1::Add} whose broadcast merge resolves one argument shape to the empty tuple \texttt{()}. The failure does not appear on the first prefill, but reliably occurs after at least one full run-and-reset cycle. We have been unable to find an existing report of this issue in OpenVINO's issue tracker.
+
+\textbf{Workaround:} call \texttt{compile\_model()} separately per stream so each InferRequest has its own fully-independent compiled graph. The cost is extra compile time (seconds per additional stream on Arc iGPU) and extra GPU memory (${\sim}2$~GB per additional Llama~8B half-stage). The resulting configuration recovers the advertised independence semantics, and is what the $41.25$~tok/s full-stack result depends on.
 
 \subsection{Results}
 
 \begin{table}[ht]
 \centering
-\caption{Micro-batching: gain depends on stage asymmetry. More imbalanced stages have more idle time to fill.}
+\caption{Micro-batching: gain depends on stage asymmetry \emph{and} on per-stage compute size. Our latest $v_5$\_beam measurements (alpha+charlie, Llama~3.1~8B INT4) scale $2.03\times$, close to the theoretical ceiling; the smaller per-stage GEMMs of $v_5$\_beam (post-\texttt{IndirectKVCache} fusion) leave more stage-idle time for the other stream to fill than did the earlier external-rotary shards.}
 \label{tab:microbatch}
-\begin{tabular}{@{}lrrrr@{}}
+\label{sec:microbatch_compare}
+\begin{tabular}{@{}llrrr@{}}
 \toprule
-Model & Single-stream & 2-stream & Gain & Stage times \\
+Model & Export / year & Single-stream & 2-stream & Gain \\
 \midrule
-Llama 3.1 8B & 14.12 & 19.4 & 1.38$\times$ & 25/25~ms \\
-Gemma 4 E2B & 8.12 & 13.51 & 1.66$\times$ & 26/42~ms \\
+Llama 3.1 8B & external-rotary v1 (2026-04) & 14.1 & 19.4 & 1.38$\times$ \\
+Llama 3.1 8B & $v_5$\_beam (2026-04, this work) & 14.51 & \textbf{29.46} & \textbf{2.03$\times$} \\
+Gemma 4 E2B & external-rotary v1 (2026-04) & 8.12 & 13.51 & 1.66$\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Llama's balanced stages leave less idle time, yielding 1.38$\times$. Gemma~4's asymmetric stages (26~ms vs.\ 42~ms) allow stage~0 to finish an entire request~B step within stage~1's processing window, yielding 1.66$\times$.
+The $v_5$\_beam Llama result is the relevant number for the full-stack story (it composes with \S\ref{sec:spec}'s speculative decoding to $41.25$~tok/s system throughput). The $1.66\times$ Gemma~4~E2B number uses an earlier export that predates $v_5$\_beam; the absolute number would shift with the $v_5$\_beam pipeline (which we have not re-run on Gemma), but the mechanism is the same.
 
-The theoretical 2-stream maximum is 2$\times$ (infinitely asymmetric stages). For asymmetry ratio $r = t_{\text{slow}} / t_{\text{fast}}$, the expected gain is $\min(N, \lceil r \rceil)$ for $N$ streams. Llama ($r = 1.0$): theoretical max $\sim$1.5$\times$ after dispatch overhead. Gemma~4 ($r = 1.6$): theoretical max $\sim$1.8$\times$.
+The theoretical 2-stream maximum is $2\times$ for balanced stages. Our measured $2.03\times$ on $v_5$\_beam exceeds this slightly---we attribute it to the GPU runtime coalescing some small-GEMM dispatches when both streams are active, though we have not confirmed this with microbenchmarks.
 
-With micro-batching, Gemma~4~E2B reaches 13.51~tok/s distributed---exceeding 13.3~tok/s single-node. Pipeline parallelism is not just about fitting large models across machines; it can be a net throughput win.
+A previously-published version of this work (2026-04-01 run, $1.38\times$) reported a smaller gain using the external-rotary export. The $v_5$\_beam shards close the monolithic-parity gap \emph{and} produce smaller per-stage compute windows for micro-batching to fill---a dual benefit of the \texttt{beam\_idx} Gather injection introduced in~\S\ref{sec:shards}.
 
 % ============================================================================
 \section{Discussion}
@@ -373,17 +483,13 @@ With micro-batching, Gemma~4~E2B reaches 13.51~tok/s distributed---exceeding 13.
 
 \subsection{When Is a Fleet Better Than Cloud?}
 
-Three conditions: the organization already owns AI PCs (sunk cost), data must stay on-premises (privacy/compliance), and the latency budget accommodates $\sim$65~ms tokens (interactive chat). Under these conditions, a 2-node fleet serves Llama~3.1~8B at 14.73~tok/s with zero marginal cost and full data locality.
+Three conditions: the organization already owns AI PCs (sunk cost), data must stay on-premises (privacy/compliance), and the latency budget accommodates $\sim$50--70~ms tokens (interactive chat). Under these conditions, a 2-node fleet running the full stack (sharded $+$ micro-batched $+$ speculative) serves two concurrent users of Llama~3.1~8B at $41.25$~tok/s aggregate ($20.5$~tok/s per user) with zero marginal cost and full data locality.
 
-A cloud-hosted Llama~3.1~8B typically achieves 30--60~tok/s but incurs per-token API costs and data residency exposure. The fleet trades throughput for cost and privacy.
+A cloud-hosted Llama~3.1~8B typically achieves $30$--$60$~tok/s but incurs per-token API costs and data residency exposure. The fleet trades peak throughput for cost and privacy---and at $100$~ms/hop cross-continental WAN, the fleet-with-speculative-decoding remains interactive ($11$~tok/s aggregate, $5.6$~tok/s per stream) where a naïve distributed pipeline falls to $2.77$~tok/s (unusable).
 
 \subsection{Scaling Projections}
 
-Llama~3.1~70B (35~GB INT4) would need roughly 7 nodes at 32~GB each. Network overhead scales linearly with hops ($\sim$6.5~ms per WiFi hop), so a 7-stage pipeline adds $\sim$39~ms---still interactive if per-stage compute stays around $\sim$25~ms. Micro-batching can interleave up to $\min(N_\text{users}, N_\text{stages})$ requests, approaching full utilization.
-
-\subsection{Speculative Execution Under WAN}
-
-We tested speculative decoding with Llama~3.2~1B as draft model (K=4 speculation depth). On LAN, the draft model's 200~ms per \texttt{generate()} call---full context re-encode each round, no incremental decoding---dominates the 35~ms TCP savings, producing a net slowdown (6.53 vs.\ 14.73~tok/s). Under WAN (50~ms+ RTT), the arithmetic shifts: 3 accepted tokens per 115~ms round trip would yield $\sim$26~tok/s, a 3.2$\times$ improvement over the 8.1~tok/s WAN baseline. Realizing this requires INT4-quantizing the draft model and implementing incremental KV-cached decoding for it.
+Llama~3.1~70B (35~GB INT4) would need roughly 7 nodes at 32~GB each. Network overhead scales linearly with hops ($\sim$6.5~ms per WiFi hop), so a 7-stage pipeline adds $\sim$39~ms---still interactive if per-stage compute stays around $\sim$25~ms. Micro-batching can interleave up to $\min(N_\text{users}, N_\text{stages})$ requests, approaching full utilization. Speculative decoding's advantage scales favorably with the number of network hops since it amortizes more round-trips per emitted token, so the full stack's benefit grows with pipeline depth---the observed $4.04\times$ speedup over naïve at $100$~ms/hop with two nodes would, by the same round-trip-amortization argument, be larger at seven nodes.
 
 \subsection{Quantization Challenges}
 
@@ -393,26 +499,42 @@ Gemma~4's Per-Layer Input (PLI) embeddings are a dense $262\text{K} \times 8960$
 
 The system assumes a trusted, reliable network. There is no fault tolerance, authentication, or encryption. WiFi latency varies by $\pm$2~ms (averaging out over many tokens). All nodes must run identical software stacks (same OpenVINO, same Python). Mixed-device pipelines (GPU~+~CPU or GPU~+~NPU) showed poor results: NPU rejects ReadValue ops entirely, and CPU stages on the same SoC contend for memory bandwidth with the GPU stage.
 
+\textbf{3-stage distributed stability.} We deployed a 3-node topology (stage~0 on alpha, stage~1 on charlie, stage~2 on beta), but the longer per-token TCP-round-trip cadence (two hops per target forward, sustained small-message traffic) triggers a \texttt{WinError 10053} (\emph{connection aborted by software}) between requests 66 and 80 of a 128-token run---after Windows Defender real-time-scan exclusions, disabling WiFi NIC RSC/LSO/coalescing offloads, \texttt{TCP\_NODELAY}~$+$~\texttt{SO\_KEEPALIVE}, and a worker-side reconnect loop. The 2-stage pipeline runs cleanly at the same message rate, so the failure is topology-specific rather than load-specific. Isolating the root cause (packet-level capture on both ends with Wireshark, and/or switching to a batched-message protocol that sends multiple tokens' worth of activations per TCP write) is future work; for this paper, all 3-stage numbers are reported in-process on a single machine (\S\ref{sec:shards}, Table~\ref{tab:shard_stages}), and all distributed numbers are 2-stage (\S\ref{sec:distributed}, \S\ref{sec:microbatch}).
+
+\textbf{WAN characterization uses sleep-simulated latency.} The sweep in Table~\ref{tab:wan} injects \texttt{time.sleep()} on the worker's receive and send boundaries, which adds deterministic one-way delay per target forward but lacks real TCP-level effects (slow-start, jitter, retransmit-under-loss). We attempted a macOS-hosted \texttt{dnctl/pfctl} latency proxy for a real-TCP WAN test; it was blocked by an unresolved macOS Python socket behavior where outbound connects to specific LAN peers returned \texttt{ENOHOSTUNREACH} despite \texttt{nc} succeeding on the same 5-tuple. Our sleep-sim should be a lower bound on real-WAN speedup (real TCP amortizes more in-flight messages per RTT); confirming this on a Linux-based dummynet host is future work.
+
 \subsection{Negative Results}
 
-Three optimization attempts that failed, documented here because the failure modes are informative:
+Optimization attempts that failed, documented here because the failure modes are informative:
 
-\textbf{Early exit.} We applied the final model's RMSNorm~+~lm\_head to layer~15 outputs, hoping high-confidence tokens could skip the second half of the network. The lm\_head never produced confident predictions at layer~15 (max softmax probability stayed below 50\%), and the 800~MB matrix multiply added 80~ms overhead per token. The fundamental issue: the lm\_head is calibrated for layer-31 representations, not layer-15. A purpose-trained lightweight exit head might work but requires calibration data we did not collect.
+\textbf{Early exit.} We applied the final model's RMSNorm~+~lm\_head to layer~15 outputs, hoping high-confidence tokens could skip the second half of the network. The lm\_head never produced confident predictions at layer~15 (max softmax probability stayed below 50\%), and the $800$~MB matrix multiply added $80$~ms overhead per token. The fundamental issue: the lm\_head is calibrated for layer-31 representations, not layer-15. A purpose-trained lightweight exit head might work but requires calibration data we did not collect.
 
-\textbf{Asymmetric shard planning.} A 12/20 layer split (vs.\ the default 16/16) yielded 2\% improvement---within measurement noise. The bottleneck is the 35~ms network round trip, not compute imbalance between stages.
+\textbf{Asymmetric shard planning.} A 12/20 layer split (vs.\ the default 16/16) yielded 2\% improvement---within measurement noise. The bottleneck is network round-trip cost, not compute imbalance between stages.
 
 \textbf{GPU~+~NPU heterogeneity.} The Panther Lake NPU (50~TOPS) rejects ReadValue operations, making it incompatible with stateful KV-cached shards. Non-stateful NPU inference is possible but requires full-sequence recomputation each token, negating any NPU speed advantage.
+
+\textbf{\texttt{KV\_CACHE\_PRECISION} and \texttt{INFERENCE\_PRECISION\_HINT} on Arc iGPU.} We tested all documented OpenVINO GPU precision hints to see if INT8 KV cache would accelerate the memory-bound decode path. On Arc B390, the INT8 KV configuration runs $3\%$ \emph{slower} than default (20.86 vs.\ 21.74~tok/s on monolithic Llama~3.1~8B INT4)---dequantization overhead exceeds the memory bandwidth savings at this sequence length on this GPU. Output is bit-exact across all hint values. Per-stage asymmetric precision would not help for the same reason (the GPU is already memory-bound-limited, not compute-bound).
+
+\textbf{Async / threaded overlap of draft and target.} At LAN, trying to overlap draft drafting on Python threads with target verify (using \texttt{SO\_KEEPALIVE}, \texttt{TCP\_NODELAY}, and GIL-releasing \texttt{infer()} calls) yields no measurable gain: $11.08$ vs.\ $11.05$~tok/s at $K\!=\!10$, $100$~ms/hop simulated. The ``all $K$ drafts accepted'' case where async helps has probability $p^K \approx 0.2\%$ at $K\!=\!10$, so simple speculation of next-step drafts during the target's network wait almost always wastes the speculative work. Tree speculation covering multiple accept-count branches would work but requires a 4D attention mask our OV export does not currently support.
+
+\textbf{C++ port of the spec-decode loop.} We considered rewriting \texttt{spec\_decode\_greedy()} in C++ to reduce Python overhead. A dedicated profile (\texttt{bench\_feed\_overhead.py}) finds Python is $0.6\%$ of wall time ($27$~ms out of $4521$~ms for $K\!=\!3$, 128 tokens); OpenVINO's \texttt{req.infer()} accounts for $99.3\%$. The effort would move nothing. The measured $22\%$ Bad-Speculation rate in VTune P-core analysis is OpenVINO's own runtime dispatch/wait loop, not user Python.
 
 % ============================================================================
 \section{Conclusion}
 \label{sec:conclusion}
 % ============================================================================
 
-A fleet of commodity Intel AI PCs can serve LLM inference at interactive speeds. The system achieves 14.73~tok/s on Llama~3.1~8B across two nodes over WiFi (85\% of single-node) and 13.51~tok/s on Gemma~4~E2B with micro-batching (102\% of single-node).
+A fleet of commodity Intel AI PCs can serve multi-user LLM inference at interactive speeds \emph{above} single-user monolithic throughput on the same hardware, and can do so across network links where naïve pipeline parallelism is unusable. The two-node full-stack Llama~3.1~8B configuration---$v_5$\_beam-exported shards, mask-based speculative decoding, two-stream micro-batching---reaches $41.25$~tok/s system throughput, $1.89\times$ the monolithic single-user baseline, and $4.04\times$ naïve distributed decode under a simulated $100$~ms/hop WAN.
 
-The counterintuitive finding---that per-stage compiled shards are faster than monolithic inference---changes the economics of distributed inference. The ``cost'' of distribution is purely network latency, and micro-batching can recover it by filling pipeline bubbles with concurrent requests.
+The three composing techniques each address a distinct bottleneck and are individually validated with bit-exact output vs.\ their respective baselines:
 
-Code, export scripts, and benchmark data are available at \texttt{[URL]}.
+\begin{itemize}[leftmargin=*]
+\item The \texttt{beam\_idx} Gather injection unlocks the OpenVINO GPU plugin's \texttt{IndirectKVCache} fusion for per-stage exports, producing shards at monolithic parity~(\S\ref{sec:shards}).
+\item Mask-based KV-cache rewind sidesteps the $\sim 45$~ms-per-call \texttt{query\_state}/\texttt{set\_state} round-trip that would otherwise make speculative decoding a net loss on stateful OpenVINO~(\S\ref{sec:spec}).
+\item Independent-state micro-batching fills the stage-idle windows that $v_5$\_beam fusion leaves smaller---at the cost of a per-stream \texttt{compile\_model} to work around an undocumented OpenVINO \texttt{reset\_state} interaction~(\S\ref{sec:ov_bug}, \S\ref{sec:microbatch})---yielding $2.03\times$ scaling at the 2-stream operating point.
+\end{itemize}
+
+Code, export scripts, all raw benchmark logs, and VTune reports are available at \texttt{[URL]}.
 
 % ============================================================================
 % References
