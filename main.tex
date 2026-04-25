@@ -357,6 +357,26 @@ Hop latency (ms) & Naïve baseline & Full stack (agg) & Per-stream & Full / naï
 
 The advantage over naïve distributed decode \emph{grows} with hop latency. At LAN the full-stack multiplier is $2.83\times$ naïve; at $100$~ms/hop it is $4.04\times$. This is the core benefit of layering speculative decoding onto a distributed pipeline: each target round-trip emits $K+1$ tokens, so per-token network overhead amortizes $1\!+\!p_\text{accept}\!\cdot\!K$ times. For our measured $K\!=\!3$ with $p_\text{accept}\!=\!0.707$, the asymptotic ceiling is $3.1\times$ over naïve; at $100$~ms/hop we approach that ceiling closely because the TCP RTT dominates compute.
 
+\paragraph{Real-WAN cross-check.} Because the sleep-sim approach in Table~\ref{tab:wan} only models the latency dimension (not the TCP cwnd dynamics that govern multi-segment messages), we ran a parallel sweep with two release-time-queue TCP latency proxies on the alpha node forwarding to charlie/beta with per-byte one-way delay. The proxy queues each chunk with a release timestamp and a separate sender thread forwards it on time, so multiple chunks can be in flight (matching tc-netem behavior, not per-chunk serialization). Run on the 3-stage Llama target-only path at the time of this revision, with the same prompt and 64-token decode budget per run:
+
+\begin{table}[ht]
+\centering
+\caption{Real-WAN sweep with on-alpha release-time-queue TCP proxies (3-stage Llama~3.1~8B v5\_beam, target-only single stream, 2 runs per latency, 64-token decode). Compared to the sleep-sim's single-hop 2-stage column in Table~\ref{tab:wan}, this row pays \emph{two} hops per token (alpha~$\to$~charlie, alpha~$\to$~beta) and gets no spec/mbatch amortization. The gap to the sleep-sim 2-stage figures comes from the topology change (2~hops/token vs.\ 1) and the absence of speculative decoding---not from the proxy method itself.}
+\label{tab:real_wan}
+\begin{tabular}{@{}lr@{}}
+\toprule
+Hop latency (ms, one-way) & Tok/s (3-stage target-only, real WAN) \\
+\midrule
+0   (LAN)  & 12.53 \\
+10         &  8.18 \\
+50         &  3.28 \\
+100        &  2.01 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Adding hop latency on the 3-stage target-only path costs more wall-clock per token than the sleep-sim suggests, because each token requires four full TCP round-trips with logits responses approaching $500$~KB --- TCP cwnd takes several RTTs to ramp on a cold flow, and persistent connections only partially amortize the warm-cwnd penalty. This is not a flaw in either sleep-sim (which captures the latency dimension correctly for stream-level behavior) or the queue proxy (which captures real TCP dynamics); it is evidence that for a paper-quality comparison, both methods should be reported. We retain Table~\ref{tab:wan}'s sleep-sim numbers as the headline because that pipeline includes spec~$+$~mbatch (matching the full-stack story); the queue-proxy numbers above isolate the 3-stage TCP overhead.
+
 Choosing the right $K$ per latency regime matters. A separate sweep (Table~\ref{tab:k_sweep}) finds that LAN prefers small~$K$ (2--3) where acceptance is high; $100$~ms/hop prefers large~$K$ (10) where batching enough tokens per round-trip dominates.
 
 \begin{table}[ht]
@@ -400,22 +420,30 @@ On the 2-stage distributed pipeline (single-stream, no spec), earlier measuremen
 
 The distributed pipeline extends to Gemma~4~E2B (5.1B, 35 layers, FP32 due to PLI quantization sensitivity, see \S\ref{sec:discussion}). Gemma~4 also exercises a feature Llama doesn't have: layers~15--34 share K/V projections with earlier layers (the weights are untrained placeholders, and inference reads from source layers' cache via \texttt{DynamicCache}). In the distributed pipeline, this means L13/L14 KV tensors must cross the stage boundary. We transmit them as additional non-stateful outputs from stage~0, received as inputs at stage~1, with a 4D$\rightarrow$3D reshape for the TCP header protocol.
 
+The Gemma path also forced a separate fix on OpenVINO 2026.1: HuggingFace's \texttt{Gemma3nTextRotaryEmbedding} computes cos/sin under \texttt{torch.autocast(enabled=False)} and casts to \texttt{x.dtype} at the end, which \texttt{torch.jit.trace} bakes into the IR as a mixed-precision \texttt{opset1::MatMul}. OpenVINO~2026.0 silently auto-promoted the operand types; 2026.1 validates element types strictly and refuses to compile (rotary block has \texttt{f16[?,256,1] x f32[?,1,?]} on GPU). We replace HF's rotary submodule with a custom \texttt{GemmaTracedRotaryEmbedding} that holds \texttt{inv\_freq} as a buffer, computes everything in FP32, and casts to target dtype once at the end. Two instances handle Gemma~4's two layer types: \texttt{sliding\_attention} (default rope, \texttt{head\_dim=256}, $\theta=10\text{k}$) and \texttt{full\_attention} (proportional rope, \texttt{head\_dim=512}, $\theta=1\text{M}$, \texttt{partial\_rotary\_factor=0.25} --- only the first 25\% of dims rotated, the rest pad with zero \texttt{inv\_freq}). The rotary-fixed shards (we call them ``v2'') compile at default GPU precision and recover full speed; the previously-reported numbers were preserved by re-export rather than the \texttt{INFERENCE\_PRECISION\_HINT="f32"} workaround (which costs ${-}10\%$ on 2-stage, ${-}60\%$ on 1-stage).
+
+We also apply the same post-export \texttt{beam\_idx} Gather injection from \S\ref{sec:shards} to Gemma's stage~0 (stage~1's KV-shared layers have no \texttt{ReadValue} ops to inject into, so it is left as-is). The injected variant is reported below as ``v2\_beam.''
+
 \begin{table}[ht]
 \centering
-\caption{Gemma~4~E2B distributed pipeline (FP32, 2-stage). Micro-batching takes the 2-node distributed configuration from $61\%$ to $102\%$ of the 1-stage single-node baseline.}
+\caption{Gemma~4~E2B 2026-04-24 (FP32, OV~2026.1.0, alpha Panther Lake B390 iGPU + charlie Lunar Lake Arc 140V iGPU). The ``v2'' column is the rotary-fixed export; ``v2\_beam'' adds post-hoc \texttt{beam\_idx} Gather injection on stage~0 to unlock the GPU plugin's \texttt{IndirectKVCache} fusion. Output byte-correct on every config.}
 \label{tab:gemma_dist}
-\begin{tabular}{@{}lrrl@{}}
+\begin{tabular}{@{}lrrr@{}}
 \toprule
-Configuration & Tok/s & Decode & Notes \\
+Configuration & 2026-04 paper & v2 (this work) & v2\_beam (this work) \\
 \midrule
-1-stage single-node (GPU) & 13.3 & 68~ms & Baseline \\
-2-stage localhost GPU$\rightarrow$GPU & 12.1 & 71~ms & 91\% of baseline \\
-2-stage multi-node GPU$\rightarrow$GPU & 8.12 & 96~ms & 61\% \\
-2-stage multi-node CPU$\rightarrow$GPU & 7.16 & 94~ms & CPU fallback \\
-\textbf{2-stream micro-batch} & \textbf{13.51} & --- & \textbf{102\% of baseline} \\
+1-stage single-node (GPU) & 13.3 & 13.69~$\pm$~0.44 & \textbf{14.13~$\pm$~0.21} \\
+2-stage localhost GPU$\rightarrow$GPU & 12.1 & 12.32~$\pm$~0.32 & \textbf{13.13~$\pm$~0.14} \\
+2-stage multi-node GPU$\rightarrow$GPU & 8.12 & \textbf{10.49~$\pm$~0.20} & 10.66~$\pm$~0.27 \\
+2-stage multi-node CPU$\rightarrow$GPU & 7.16 & --- & --- \\
+2-stream micro-batch (multi-node) & 13.51 & --- & --- \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+The CPU stage~0 path is currently blocked by an OpenVINO 2026.1 CPU-plugin shape-inference bug at the empty-state KV-cache concat (Concat receives \texttt{ReadValue:f32[0,1,0,256]} alongside \texttt{RoPE:f32[1,1,16,256]}; the GPU plugin handles the empty leading dim, the CPU plugin rejects it). The 7.16~tok/s paper number predates 2026.1 and is not reproducible on the current toolchain until that bug is fixed upstream; we leave it in the table for historical comparison. The 2-stream micro-batch row was measured with the older external-rotary export and is left at $13.51$ for cross-version comparison; we have not re-run a Gemma micro-batch on the v2/v2\_beam shards.
+
+The single-stream multi-node figure of $\mathbf{10.49}$~tok/s on v2 (and $10.66$ with \texttt{beam\_idx} fusion) is $29\%$ better than the 2026-04 paper's $8.12$. The improvement composes two effects: the v2 export removes a precision-hint penalty present in any compile attempted on OV~2026.1+, and the Lunar Lake-class iGPU on charlie has matured with the OV~2026.1 release. The $10.66$~tok/s v2\_beam delta over v2 ($+1.6\%$) is small in distributed mode because per-token wall time is dominated by the 8--16~KB hidden-state and 2-pair cross-KV TCP round-trips, not on-device compute --- consistent with the in-process result where v2\_beam beats v2 by $6.6\%$ (compute-bound) versus distributed's $1.6\%$ (network-bound).
 
 % ============================================================================
 \section{Multi-User Throughput via Micro-Batching}
@@ -468,7 +496,7 @@ Gemma 4 E2B & external-rotary v1 (2026-04) & 8.12 & 13.51 & 1.66$\times$ \\
 \end{tabular}
 \end{table}
 
-The $v_5$\_beam Llama result is the relevant number for the full-stack story (it composes with \S\ref{sec:spec}'s speculative decoding to $41.25$~tok/s system throughput). The $1.66\times$ Gemma~4~E2B number uses an earlier export that predates $v_5$\_beam; the absolute number would shift with the $v_5$\_beam pipeline (which we have not re-run on Gemma), but the mechanism is the same.
+The $v_5$\_beam Llama result is the relevant number for the full-stack story (it composes with \S\ref{sec:spec}'s speculative decoding to $41.25$~tok/s system throughput). The $1.66\times$ Gemma~4~E2B micro-batch ratio uses the older external-rotary export (single-stream baseline of $8.12$~tok/s); on the v2 and v2\_beam single-stream baselines (\S\ref{sec:gemma}, $10.49$ and $10.66$~tok/s respectively), we have not re-run the 2-stream micro-batch coordinator. The mechanism is the same and we expect a similar ratio, but a fresh measurement would be required to claim a number.
 
 The theoretical 2-stream maximum is $2\times$ for balanced stages. Our measured $2.03\times$ on $v_5$\_beam exceeds this slightly---we attribute it to the GPU runtime coalescing some small-GEMM dispatches when both streams are active, though we have not confirmed this with microbenchmarks.
 
@@ -497,9 +525,9 @@ Gemma~4's Per-Layer Input (PLI) embeddings are a dense $262\text{K} \times 8960$
 
 The system assumes a trusted, reliable network. There is no fault tolerance, authentication, or encryption. WiFi latency varies by $\pm$2~ms (averaging out over many tokens). All nodes must run identical software stacks (same OpenVINO, same Python). Mixed-device pipelines (GPU~+~CPU or GPU~+~NPU) showed poor results: NPU rejects ReadValue ops entirely, and CPU stages on the same SoC contend for memory bandwidth with the GPU stage.
 
-\textbf{3-stage distributed stability.} We deployed a 3-node topology (stage~0 on alpha, stage~1 on charlie, stage~2 on beta), but the longer per-token TCP-round-trip cadence (two hops per target forward, sustained small-message traffic) triggers a \texttt{WinError 10053} (\emph{connection aborted by software}) between requests 66 and 80 of a 128-token run---after Windows Defender real-time-scan exclusions, disabling WiFi NIC RSC/LSO/coalescing offloads, \texttt{TCP\_NODELAY}~$+$~\texttt{SO\_KEEPALIVE}, and a worker-side reconnect loop. The 2-stage pipeline runs cleanly at the same message rate, so the failure is topology-specific rather than load-specific. Isolating the root cause (packet-level capture on both ends with Wireshark, and/or switching to a batched-message protocol that sends multiple tokens' worth of activations per TCP write) is future work; for this paper, all 3-stage numbers are reported in-process on a single machine (\S\ref{sec:shards}, Table~\ref{tab:shard_stages}), and all distributed numbers are 2-stage (\S\ref{sec:distributed}, \S\ref{sec:microbatch}).
+\textbf{3-stage distributed stability (resolved 2026-04-24).} An earlier revision flagged a \texttt{WinError 10053} (\emph{connection aborted by software}) on the 3-node topology between requests 66 and 80 of a 128-token run. The fix was topology, not protocol: in the original setup, alpha was on Wi-Fi and the 10053 fires when a Wi-Fi NIC's TCP stack times out a retransmission --- two of the three hops in the 3-stage path traversed Wi-Fi, doubling the failure surface relative to 2-stage. With all three nodes on Ethernet (Wi-Fi disabled), three back-to-back 128-token decodes complete with no abort: $14.42 / 14.44 / 14.47$~tok/s ($\approx$2-stage parity, single stream, no spec, no mbatch; output byte-correct). A reproducer ($154$~req/s sustained alpha-charlie smoke test, identical traffic shape) confirms the LAN handles the load with margin to spare; the 10053 was a Wi-Fi-stack edge case, not a protocol-level bug. We have not yet measured the full stack (3-stage target~$+$~spec~$+$~mbatch) because the spec~$+$~mbatch coordinator is currently 2-stage-only (\S\ref{sec:microbatch}); extending it to 3-stage is straightforward but deferred.
 
-\textbf{WAN characterization uses sleep-simulated latency.} The sweep in Table~\ref{tab:wan} injects \texttt{time.sleep()} on the worker's receive and send boundaries, which adds deterministic one-way delay per target forward but lacks real TCP-level effects (slow-start, jitter, retransmit-under-loss). The sleep-sim is a lower bound on real-WAN speedup (real TCP amortizes more in-flight messages per RTT); confirming this on a real-network testbed is future work.
+\textbf{WAN characterization (sleep-sim and queue-proxy, both reported).} The headline sweep in Table~\ref{tab:wan} uses \texttt{time.sleep()} on the worker's recv/send boundaries to inject deterministic one-way delay per target forward. Table~\ref{tab:real_wan} adds a release-time-queue TCP-proxy sweep on the 3-stage Llama target-only path to capture real TCP dynamics (per-byte one-way delay, multi-segment in-flight). The two methods differ: sleep-sim captures latency for the full stack with spec~$+$~mbatch (matching the topology of \S\ref{sec:fullstack}); the queue-proxy captures real per-RTT congestion-window behavior on a different topology (3-stage target-only, no spec, no mbatch). We report both rather than picking one --- a real-WAN measurement of the spec~$+$~mbatch path on a multi-machine testbed remains future work.
 
 \subsection{Negative Results}
 
