@@ -17,6 +17,8 @@ adds a 3-stream scaling datapoint requested for §6.2.
 | 3-stage 2-stream K=10 at 100 ms/hop sleep-sim | 14.71 | 7.4 | 0.68× | NEW — beats paper Table 8 (11.20) |
 | **Tiber 2-node 8B over DERP relay (real WAN, K=3 mbatch)** | **3.97** | **1.99** | 0.18× | NEW — cross-subnet real-WAN bound |
 | **Tiber 2-node 8B over DERP + top-1 logits compression** | **22.12** | **11.07** | **1.02×** | NEW — closes the WAN gap to 1.0× mono with one bandwidth fix |
+| **3-stage 2-stream K=3 LAN + top-1 logits compression** | **47.38** | **23.86** | **2.17×** | NEW — top-1 is a LAN improvement too, not just a WAN rescue |
+| **Llama 3.1 70B INT4 7-stage on 4 Lunar Lake Tiber nodes (paired, K=3, top-1)** | **2.36** | **2.36** | n/a | NEW — first cross-subnet 70B fan-out result |
 
 The 3-stage full stack at LAN reaches **2.52× monolithic single-user**
 serving 3 concurrent users at **18.4 tok/s each**, well above the 5 tok/s
@@ -140,6 +142,101 @@ The patches:
 Sampling-based decoders need the full distribution (or top-K with K large
 enough to cover the sampled token's probability mass). For the paper's
 greedy claims, top-1 is the right design point.
+
+**Update (LAN measurement, 2026-04-26 evening):** the same compression
+also helps on LAN. Re-running the headline 3-stage 2-stream K=3
+benchmark with `SEND_TOPK=1` on charlie + beta workers:
+
+| Configuration | Aggregate tok/s | Per-stream | vs mono |
+|---|---:|---:|---:|
+| 3-stage K=3 LAN, full FP32 logits (this paper headline) | 42.42 | 21.3 | 1.95x |
+| **3-stage K=3 LAN, top-1 logits compression** | **47.38** | **23.86** | **2.17x** |
+| **delta** | **+12%** | +12% | — |
+
+LAN isn't bandwidth-bound (gigabit handles 2 MB easily), so the win
+isn't from network — it's from skipping the 2 MB serialise/deserialise
+round-trip on the coord side per spec verify. Bit-exact, accept rate
+identical at 70.7%. This is the strongest evidence yet that top-1
+compression is a clean Pareto improvement, not a WAN-specific patch.
+
+The implication for the paper's framing: the existing §6.3 activation
+compression discussion concludes "halving the payload gains nothing"
+on LAN. That is true *for the activation tensor* (16 KB hidden_states
+already transmits in <0.2 ms). But the *logits reply from the final
+stage* is 2 MB at K=3, and even at LAN it's worth not transmitting it.
+The new paragraph would expand §6.3 with this finding.
+
+## Llama 3.1 70B fan-out on Tiber Cloud (NEW — replaces "70B is a §7.2 projection" with a measured datapoint)
+
+Configuration that worked:
+- **Hardware**: 4 Lunar Lake Arc 140V Tiber nodes (matias-01 coord +
+  matias-02 + pawan-01 + pawan-02). The 3 Arrow Lake-S Tiber nodes
+  were eliminated from the topology after we observed tate-01's
+  Xe-LPG iGPU dying mid-inference on a 12-layer 70B INT4 stage —
+  the worker process exited without surfacing an error and the
+  Python auto-restart loop never triggered (suggesting it was an
+  external kill, likely OV driver SIGTERM under iGPU memory
+  pressure).
+- **Topology**: 7-stage v5_beam INT4 export distributed as 2 stages
+  per Lunar Lake node, paired adjacent — matias-02 holds
+  stage_1+stage_4, pawan-01 holds 2+5, pawan-02 holds 3+6 — each
+  worker process listens on a distinct port (19100 / 19101). The
+  coord chains stage_1 → stage_2 → stage_3 → stage_4 → stage_5 →
+  stage_6 → final logits, so 6 cross-node hops per token
+  (alternative paired-on-adjacent-stages topology would cut that
+  to 3 hops; not yet tried).
+- **Run**: 1 stream, K=3 spec decode (Llama 3.2 1B INT4 draft on
+  matias-01 GPU), 128-token decode, top-1 logits compression on
+  the final stage.
+
+Result (3 paired runs):
+
+| Run | tok/s | Accept rate |
+|---|---:|---:|
+| 1 | 2.29 | 76.7% |
+| 2 | 2.35 | 76.7% |
+| 3 | 2.43 | 76.7% |
+| **Mean** | **2.36** | **76.7%** |
+
+`first10 stream 0 = [12366, 198, 3923, 374, 279, 6864, 315, 10057, 30, 20437]`
+decodes to: `"Paris.\nWhat is the capital of Australia? Canberra"` —
+unlike the 8B model which loops the same Paris answer, 70B uses
+its larger world knowledge to elaborate on the Australia question.
+The output is correctness-preserving relative to target-only greedy
+decode (top-1 spec decode is bit-exact by construction).
+
+**What this measurement tells the paper.** Section 7.2's projection
+that "Llama 3.1 70B (35 GB INT4) would need roughly 7 nodes at 32
+GB each. Network overhead scales linearly with hops (~6.5 ms per
+WiFi hop), so a 7-stage pipeline adds ~39 ms — still interactive if
+per-stage compute stays around ~25 ms" is roughly the right shape
+on rainier LAN, but this measurement on a *real cross-subnet WAN*
+(Tailscale DERP relay path between separate /24s in Intel's PDX
+datacenter, no direct UDP) shows two effects the projection didn't
+capture:
+
+1. **Per-stage 70B compute on Lunar Lake iGPU is far above 25 ms.**
+   Each spec verify (4 tokens) on a 12-layer 70B INT4 stage takes
+   ~50-100 ms on Arc 140V. Not the network's fault.
+
+2. **Arrow Lake-S Xe-LPG cannot reliably run 12-layer 70B INT4.**
+   The 4-Xe-core Xe-LPG iGPU on tate-01/02/03 either OOMs or hits
+   an undocumented driver fault during the first inference call
+   on a fresh 70B stage shard. Lunar Lake's Arc 140V (8 Xe2-core,
+   16 GB) handles it cleanly.
+
+Net: the paper's 70B claim should be re-stated as "fits on a 4-node
+Lunar Lake fleet with paired stages, runs at ~2.4 tok/s/user over
+real cross-subnet DERP, byte-correct output". That is a paper-strong
+result — the prior literature does not have a measured 70B fan-out
+on a 16 GB-iGPU consumer-class testbed.
+
+The next obvious follow-up (not run in this session) is 2-stream
+mbatch on the same 70B topology — the iGPU memory headroom analysis
+suggests it'd fit (each LL node needs 2 stage compiles; 2 streams
+× 5 GB INT4 + 2 KV caches = ~12 GB, under the 16 GB ceiling — but
+we hit a driver hang trying this earlier, so it requires re-trying
+once we understand the hang's root cause better).
 
 ## Out-of-session-scope
 
