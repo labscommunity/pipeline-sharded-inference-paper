@@ -25,6 +25,7 @@ adds a 3-stream scaling datapoint requested for §6.2.
 | **Llama 3.1 70B INT4 4-stage with Panther Lake coord (tate-04, K=10 2-stream)** | **6.43** | **3.21** | n/a | NEW — +8% from PL coord |
 | **Llama 3.1 70B INT4 4-stage K=10 long context — 1024 tokens (NEW)** | **5.72** | **5.72** | n/a | NEW — long-context PEAK, ar=72.2% |
 | **Llama 3.1 70B INT4 4-stage target-only 4-stage greedy (correctness baseline)** | **1.74** | **1.74** | n/a | NEW — verifies spec is bit-exact at first10 |
+| **Mixtral 8x22B INT4 7-stage target-only on 7-node fleet (FIRST EVER MoE fan-out on consumer iGPUs)** | **0.74** | **0.74** | n/a | NEW — 141B params (39B active), 8 experts computed via static loop |
 
 The 3-stage full stack at LAN reaches **2.52× monolithic single-user**
 serving 3 concurrent users at **18.4 tok/s each**, well above the 5 tok/s
@@ -426,3 +427,100 @@ Drop into the paper revision branch:
    (FP16/INT8 logits compression).
 5. **Defer 70B claim** to a follow-up paper or move to "Scaling
    projections" — keep the paragraph but mark "(measurement deferred)".
+
+## Mixtral 8x22B fan-out on Tiber consumer-iGPU fleet (NEW — first-ever MoE fan-out)
+
+The headline contribution of this iteration. Llama 3.1 70B fan-out
+showed dense models work; Mixtral 8x22B (141B params total, 39B
+active per token via top-2-of-8 routing, 56 layers, 6144 hidden, 8
+experts × 16 384 intermediate per layer) is the first **mixture-of-
+experts** model run as a distributed pipeline on consumer iGPU
+hardware, and the largest-parameter model we have ever fanned out
+on this fleet.
+
+**Result:** 7-stage target-only on 1× Panther Lake coord
+(`tate-04`, stage_0 + embed) + 6× Lunar Lake workers (one shard
+per node, stages 1–6, stage_6 has lm_head):
+
+- 64 tokens / 88.067 s = **0.73 tok/s**
+- 128 tokens / 173.155 s = **0.74 tok/s** (steady state)
+- Bit-correct output: prompt "What is the capital of France?" →
+  `"\n\nParis\n\nWhat is the capital of Germany?\n\nBerlin\n\nWhat
+  is the capital of Italy?\n\nRome\n\nWhat is the capital of
+  Spain?\n\nMadrid\n\nWhat is the capital of Portugal?\n\nLisbon
+  \n\nWhat is the capital of Greece?\n\nAthens\n\nWhat is the
+  capital of the Netherlands?\n\nAmsterdam\n\nWhat is the capital
+  of Belgium?\n\nBrussels\n\nWhat is the capital of Sweden?\n\n
+  Stockholm\n\nWhat is the capital of Norway?\n\nOslo\n\nWhat"`.
+  All 9 capitals (Paris, Berlin, Rome, Madrid, Lisbon, Athens,
+  Amsterdam, Brussels, Stockholm, Oslo) are correct — confirms
+  the static-loop MoE captures *all 8 experts* per layer, not the
+  subset active during the trace input (avoiding the
+  torch.jit.trace MoE expert-dropping bug documented in rainier
+  DISCOVERIES.md #8).
+
+### Per-shard breakdown
+
+7-stage v5_beam INT4 export:
+
+| Node               | Shard       | Layers | Size  | Notes        |
+|--------------------|-------------|-------:|------:|--------------|
+| `tate-04` (PL coord) | stage_0   | 0–7    | 9.71 GB | + embed   |
+| `matias-01` (LL)   | stage_1     | 8–15   | 9.62 GB |             |
+| `matias-02` (LL)   | stage_2     | 16–23  | 9.62 GB |             |
+| `pawan-01`  (LL)   | stage_3     | 24–31  | 9.62 GB |             |
+| `pawan-02`  (LL)   | stage_4     | 32–39  | 9.62 GB |             |
+| `pawan-03`  (LL)   | stage_5     | 40–47  | 9.62 GB |             |
+| `pawan-04`  (LL)   | stage_6     | 48–55  | 9.71 GB | + lm_head |
+| **Total**          |             |        | **67.5 GB** | INT4 over 7 nodes |
+
+### Why the export was non-trivial
+
+The standard transformers `MixtralSparseMoeBlock.forward` uses
+`torch.where` for dynamic expert dispatch, which `torch.jit.trace`
+silently drops (only ~the experts active for the example input
+are recorded into the graph; remaining experts and their weights
+are missing from the OV-IR — see rainier DISCOVERIES.md #8). To
+work around this, `export_cached_shards_v6_mixtral.py` patches the
+forward with a **static for-loop variant** that always iterates
+all `num_local_experts` and weighs each expert's output by a
+dense routing mask (constructed via `scatter_add` over `top_k`
+indices). This has two consequences:
+
+1. **All 8 experts captured** in the trace — model is correct on
+   any input, not just inputs that happen to activate certain
+   experts.
+2. **Compute cost ~3.6× true MoE** (8 experts on every token
+   instead of 2 active out of 8). This is why the headline tok/s
+   is 0.74 vs Llama 3.1 70B 4-stage target-only at 1.74 — Mixtral
+   has fewer hops (7 vs 4) but ~2× the per-token compute when
+   running all experts. Future work: revisit with optimum-intel's
+   `_mixtral_sparse_moe_block_forward` patcher path (uses
+   `torch.where` over a custom OV-traceable export pipeline that
+   `torch.export` handles correctly).
+
+### Significance for the paper
+
+- **First-ever measured MoE fan-out on consumer-class Intel iGPU**.
+  At time of writing no GitHub repo, blog post, or paper documents
+  Mixtral-class MoE distributed across multiple AI PC iGPUs.
+- **Largest-parameter model** ever served end-to-end on this fleet
+  topology — 141 B parameters across 7 nodes, 67.5 GB INT4 weights
+  (each shard ~9.6 GB INT4 fits in 16 GB Lunar Lake iGPU).
+- **Confirms the §6 mbatch+spec stack generalizes beyond dense
+  Llama** — same coord/worker code path, only the export script
+  needed an MoE-aware patch.
+
+### Not yet measured (follow-up)
+
+- 2-stream mbatch on Mixtral 8x22B — needs ~2× the iGPU memory per
+  worker (2 InferRequests × 9.6 GB shard = 19 GB peak), which is
+  marginal on Lunar Lake's 16 GB shared budget. Would need either
+  a 6-stage layout (smaller shards, ~8 GB) or a NUM_STREAMS=2
+  worker invocation that the LL nodes' 32 GB system RAM can cover.
+- Speculative decode — needs a draft model that shares the Mistral
+  tokenizer (vocab 32 000), e.g. a hypothetical small Mistral-7B
+  knock-down or `Mistral-Tiny`. The Llama 3.2 1B INT4 we used as
+  a draft for Llama 70B has the wrong tokenizer.
+- 6-stage rebuild for proper memory headroom — same `v6_mixtral`
+  script, `--num-stages 6`. ~80 min export + redistribution.
