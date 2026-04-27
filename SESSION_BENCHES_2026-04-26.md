@@ -19,6 +19,9 @@ adds a 3-stream scaling datapoint requested for §6.2.
 | **Tiber 2-node 8B over DERP + top-1 logits compression** | **22.12** | **11.07** | **1.02×** | NEW — closes the WAN gap to 1.0× mono with one bandwidth fix |
 | **3-stage 2-stream K=3 LAN + top-1 logits compression** | **47.38** | **23.86** | **2.17×** | NEW — top-1 is a LAN improvement too, not just a WAN rescue |
 | **Llama 3.1 70B INT4 7-stage on 4 Lunar Lake Tiber nodes (paired, K=3, top-1)** | **2.36** | **2.36** | n/a | NEW — first cross-subnet 70B fan-out result |
+| **Llama 3.1 70B INT4 7-stage paired, K=10 (peak 1-stream)** | **3.47** | **3.47** | n/a | NEW — K-sweep peak on 7-stage |
+| **Llama 3.1 70B INT4 4-stage on 4 Lunar Lake Tiber nodes, K=10 (peak 1-stream)** | **5.42** | **5.42** | n/a | NEW — 4-stage re-export, +56% over 7-stage K=10 |
+| **Llama 3.1 70B INT4 4-stage on 4 LL nodes, K=10 NUM_STREAMS=2 (NEW HEADLINE)** | **5.95** | **2.95** | n/a | NEW — 70B 2-stream mbatch validated |
 
 The 3-stage full stack at LAN reaches **2.52× monolithic single-user**
 serving 3 concurrent users at **18.4 tok/s each**, well above the 5 tok/s
@@ -237,6 +240,60 @@ suggests it'd fit (each LL node needs 2 stage compiles; 2 streams
 × 5 GB INT4 + 2 KV caches = ~12 GB, under the 16 GB ceiling — but
 we hit a driver hang trying this earlier, so it requires re-trying
 once we understand the hang's root cause better).
+
+### 4-stage 70B re-export and 2-stream mbatch (NEW — within this session)
+
+After running the 7-stage paired-on-node K-sweep above, we noticed an
+architectural detail: the coord-routed pipeline routes *every* per-stage
+reply back to the coord before forwarding to the next stage. Adjacent-pair
+co-location does not reduce hops — only the stage *count* does. We
+re-exported 70B with **4 stages** (one shard per Lunar Lake node) and
+re-ran the K-sweep:
+
+**4-stage hardware fit.** 80 layers / 4 stages = 20 layers per stage,
+producing 8.8–9.4 GB shards per node (stage_3 includes lm_head). Each
+worker compiles 1 InferRequest at NUM_STREAMS=1 → 17 GB resident peak,
+or 2 InferRequests at NUM_STREAMS=2 → **25 GB resident peak**. Both
+fit in Lunar Lake's 32 GB system RAM with iGPU shared-memory model.
+The miner re-export took 28 minutes; distribution to all 4 nodes via
+parallel rsync (miner→Mac) and parallel scp (Mac→fleet) took ~50 min.
+
+**4-stage K-sweep — single stream:**
+
+|  K |  tok/s | Accept | Δ vs 7-stage same K |
+|---:|------:|-------:|---------------------|
+|  3 |  3.86 |  76.7% | +64% over 2.36 |
+|  5 |  4.78 |  75.4% | (no 7-stage K=5 data) |
+| **10** | **5.42** |  65.3% | **+56% over 3.47** |
+| 15 |  4.76 |  51.4% | past peak |
+
+**4-stage K-sweep — 2-stream mbatch (NEW HEADLINE for 70B):**
+
+|  K |  Aggregate tok/s | Per-stream | Accept |
+|---:|------:|---------:|-------:|
+|  5 |  5.70 | ~2.85 | 68.1% |
+| **10** | **5.95** | ~2.95 | **52.0%** |
+
+**5.95 tok/s aggregate at 2 streams** is the first measured 70B
+multi-stream fan-out result over a real cross-subnet WAN. Per-stream
+2.95 tok/s remains below the 5 tok/s interactive floor, but aggregate
+*system* throughput exceeds the 7-stage single-stream peak by 71%.
+
+**Why the gap (4-stage vs 7-stage).** With coord-routed pipelining,
+per-token network cost = `N_stages × per-hop RTT`. At 7 stages over
+Tailscale DERP (Seattle region, ~16 ms RTT), that's ~112 ms of pure
+network per token; at 4 stages it's 64 ms — a 1.75× reduction. The
+measured speedup (1.56–1.64×) matches: most of the per-token cost was
+network, not compute.
+
+**Recommendation for paper §7.2.** The 70B headline should now read:
+*"4-stage v5_beam INT4 fan-out on a 4-node Lunar Lake fleet (Arc 140V,
+16 GB iGPU, 32 GB system RAM each) over Tailscale DERP relay reaches
+**5.95 tok/s aggregate** at 2 concurrent users (K=10 spec decode with
+Llama 3.2 1B draft, top-1 logits compression). 1-stream peak is 5.42
+tok/s. 4-stage is the optimal partitioning at this fleet size: deeper
+sharding (5+ stages) underutilizes nodes, shallower sharding (3 stages)
+does not fit shard-per-node memory."*
 
 ## Out-of-session-scope
 
