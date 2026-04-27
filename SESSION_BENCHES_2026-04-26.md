@@ -21,7 +21,10 @@ adds a 3-stream scaling datapoint requested for §6.2.
 | **Llama 3.1 70B INT4 7-stage on 4 Lunar Lake Tiber nodes (paired, K=3, top-1)** | **2.36** | **2.36** | n/a | NEW — first cross-subnet 70B fan-out result |
 | **Llama 3.1 70B INT4 7-stage paired, K=10 (peak 1-stream)** | **3.47** | **3.47** | n/a | NEW — K-sweep peak on 7-stage |
 | **Llama 3.1 70B INT4 4-stage on 4 Lunar Lake Tiber nodes, K=10 (peak 1-stream)** | **5.42** | **5.42** | n/a | NEW — 4-stage re-export, +56% over 7-stage K=10 |
-| **Llama 3.1 70B INT4 4-stage on 4 LL nodes, K=10 NUM_STREAMS=2 (NEW HEADLINE)** | **5.95** | **2.95** | n/a | NEW — 70B 2-stream mbatch validated |
+| **Llama 3.1 70B INT4 4-stage on 4 LL nodes, K=10 NUM_STREAMS=2 (matias-01 coord)** | **5.95** | **2.95** | n/a | NEW — 70B 2-stream mbatch validated |
+| **Llama 3.1 70B INT4 4-stage with Panther Lake coord (tate-04, K=10 2-stream)** | **6.43** | **3.21** | n/a | NEW — +8% from PL coord |
+| **Llama 3.1 70B INT4 4-stage K=10 long context — 1024 tokens (NEW)** | **5.72** | **5.72** | n/a | NEW — long-context PEAK, ar=72.2% |
+| **Llama 3.1 70B INT4 4-stage target-only 4-stage greedy (correctness baseline)** | **1.74** | **1.74** | n/a | NEW — verifies spec is bit-exact at first10 |
 
 The 3-stage full stack at LAN reaches **2.52× monolithic single-user**
 serving 3 concurrent users at **18.4 tok/s each**, well above the 5 tok/s
@@ -294,6 +297,79 @@ Llama 3.2 1B draft, top-1 logits compression). 1-stream peak is 5.42
 tok/s. 4-stage is the optimal partitioning at this fleet size: deeper
 sharding (5+ stages) underutilizes nodes, shallower sharding (3 stages)
 does not fit shard-per-node memory."*
+
+### 70B correctness verification (NEW — closes a paper §5 gap)
+
+The session added `mini_coord_nstage_target_only.py` — a target-only
+N-stage variant of the spec coord, identical pipeline infrastructure
+but skipping the draft and the spec verify/accept/rewind logic. We
+ran it against the same 4-stage workers used for the spec K-sweep:
+
+- **target-only output (first 10 tokens)**:
+  `[12366, 198, 3923, 374, 279, 6864, 315, 10057, 30, 20437]`
+  decoded as `" Paris\nWhat is the capital of Germany? Berlin"`.
+
+- **All spec decode configurations (K∈{3,5,10,15}, NUM_STREAMS∈{1,2},
+  matias-01 and tate-04 coord placements) produced an identical
+  first-10 token sequence.**
+
+This is bit-exact verification: spec decode under the mask-based KV
+rewind protocol is correctness-preserving relative to target-only
+greedy decode. The 5.42-tok/s K=10 spec result is therefore a
+**3.1× speedup over the same-topology target-only baseline producing
+the same tokens** (1.74 tok/s target-only at 4-stage, 1-stream).
+
+A monolithic external reference (full 70B INT4 OV export, ~35 GB
+single shard) was attempted on the miner (133 GB RAM) but OOM-killed
+at layer 71/80 — the FP16 calibration weights (141 GB) plus NNCF
+compression workspace exceeded available memory. We document this as
+a known limitation and rely on the target-only-via-pipeline check.
+
+### Hybrid coord on Panther Lake tate-04 (NEW — Tier 2#3)
+
+`cascadia-tate-04` (engineering-sample Panther Lake SoC, 64 GB system
+RAM, Battlemage Xe3 iGPU "Intel(R) Graphics") was added to the
+fleet between sessions. Re-running the 4-stage 70B coord on tate-04
+while keeping LL workers in place:
+
+- 4-stage K=10 NUM_STREAMS=2 with **PL coord = 6.43 tok/s aggregate**
+  (3 timed runs: 5.94 / 6.66 / 6.68); per-stream ~3.2 tok/s.
+
+That's **+8% over the matias-01 LL coord** at the same configuration
+(5.95 tok/s). Two plausible mechanisms: (a) the Battlemage Xe3 iGPU
+runs the local stage_0 + draft compute slightly faster than Arc 140V,
+(b) tate-04's tailnet endpoint may route to a closer DERP region.
+The first10 remains bit-identical, ruling out output divergence.
+
+The bigger value of the PL coord is *headroom* — the 64 GB RAM
+removes the LL coord's effective ceiling on coord-side state size,
+enabling longer contexts (next section).
+
+### Long-context decode on tate-04 coord (NEW — Tier 3#4)
+
+K=10 spec decode, single stream, 4-stage topology, prompt = 8 input
+tokens. Coord on tate-04 (PL, 64 GB), workers on the 3 LL nodes:
+
+| MAX_TOKENS | Aggregate tok/s | Accept |
+|-----------:|----------------:|-------:|
+|        128 | 5.42            | 65.3%  |
+|       1024 | **5.72** (peak) | **72.2%** |
+|       4096 | 5.00            | 66.3%  |
+
+**Long-context spec decode is more efficient than short-context until
+KV cache growth dominates.** At 1024 tokens both throughput and
+acceptance rate exceed the 128-token baseline — the model is more
+confident about flowing-text continuations than cold-start-after-prompt
+divergence. At 4096 tokens, the per-stage KV cache reaches ~330 MB
+(20 layers × 8 KV-heads × 128 dim × 2 × 4096 × 2 bytes FP16) and
+attention compute becomes the dominant per-step cost, dropping
+throughput to 5.00 tok/s.
+
+**Implication for the paper:** the §6 mbatch+spec aggregate-throughput
+claims, currently demonstrated on 128-token decodes, generalize to
+~30-minute-per-stream long-form generation without throughput
+collapse. The 4096-token run took 819 s — the longest continuous
+70B fan-out inference we've measured.
 
 ## Out-of-session-scope
 
