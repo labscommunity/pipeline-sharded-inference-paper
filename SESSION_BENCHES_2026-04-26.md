@@ -26,6 +26,7 @@ adds a 3-stream scaling datapoint requested for §6.2.
 | **Llama 3.1 70B INT4 4-stage K=10 long context — 1024 tokens (NEW)** | **5.72** | **5.72** | n/a | NEW — long-context PEAK, ar=72.2% |
 | **Llama 3.1 70B INT4 4-stage target-only 4-stage greedy (correctness baseline)** | **1.74** | **1.74** | n/a | NEW — verifies spec is bit-exact at first10 |
 | **Mixtral 8x22B INT4 7-stage target-only on 7-node fleet (FIRST EVER MoE fan-out on consumer iGPUs)** | **0.74** | **0.74** | n/a | NEW — 141B params (39B active), 8 experts computed via static loop |
+| **Mixtral 8x22B v7 — sparse MoE via torch.export (counterintuitive)** | **0.06** | **0.06** | n/a | NEW — 12× SLOWER despite computing 1/4 the experts; OV iGPU prefers static shapes |
 
 The 3-stage full stack at LAN reaches **2.52× monolithic single-user**
 serving 3 concurrent users at **18.4 tok/s each**, well above the 5 tok/s
@@ -524,3 +525,41 @@ indices). This has two consequences:
   a draft for Llama 70B has the wrong tokenizer.
 - 6-stage rebuild for proper memory headroom — same `v6_mixtral`
   script, `--num-stages 6`. ~80 min export + redistribution.
+
+### v7 sparse-MoE attempt — measured the wrong direction (NEW)
+
+We built `export_cached_shards_v7_sparse_moe.py` to address v6's
+"all 8 experts per token" overhead by switching to `torch.export`
++ a custom sparse forward (`torch.where` selects active experts;
+`scatter_add` accumulates partial outputs). The OV graph has
+**6065 ops/stage** vs v6's **15020** — sparse compute confirmed.
+Same Mixtral 8x22B 7-stage layout, same 1 PL coord + 6 LL workers.
+
+**Result: 0.06 tok/s** (12× slower than v6's 0.74 tok/s) with
+**bit-identical output** (same first-10 tokens, same geography
+quiz continuation). Sparse is correctness-preserving but
+performance-disastrous *on this runtime*.
+
+**Why:** OpenVINO's iGPU plugin (Lunar Lake Arc 140V) is heavily
+optimized for static-shape kernels. The sparse forward emits
+ops with data-dependent shapes — `torch.where` returns a
+`[num_active_tokens]` index tensor whose size depends on routing
+weights, `index_select` produces `[num_active_tokens, hidden]`
+gathered states, and `scatter_add` writes into a fixed-shape
+output via dynamic indices. None of these can be fused or
+tiled at compile time, so they fall to the slow general-purpose
+runtime path. v6's all-8-experts loop is heavier in arithmetic
+but every tensor has a known shape at compile time, so the
+plugin stays in its fast path the whole inference.
+
+**Paper takeaway:** the textbook claim that "sparse MoE saves
+compute" assumes a runtime that handles dynamic shapes well.
+On consumer Intel iGPU via OpenVINO, **the dense-equivalent
+static implementation is 12× faster than the sparse "correct"
+implementation** because static-shape kernel fusion dominates
+the savings from skipping inactive expert FLOPs. For the
+consumer-hardware MoE deployment story, this rewrites the
+optimization advice: "compile to shapes the runtime can fast-path"
+beats "compute fewer FLOPs". v6 stands as the production
+headline; v7 is committed as a documented dead-end and a useful
+counterexample.
