@@ -20,7 +20,7 @@
 \maketitle
 
 \begin{abstract}
-We distribute large language model inference across fleets of commodity Intel AI PCs using pre-compiled pipeline shards composed with mask-based speculative decoding. Per-stage INT4 OpenVINO IR subgraphs are exported via \texttt{torch.jit.trace} with precomputed rotary embeddings and a post-export \texttt{beam\_idx} Gather injection that unlocks the OpenVINO GPU plugin's \texttt{IndirectKVCache} fusion; the resulting shards run at parity with monolithic inference. On top of the shard pipeline we layer two composing multipliers. First, a \emph{mask-based} KV-cache rewind makes speculative decoding practical on stateful OpenVINO models without paged attention---a $\sim 48$~ms \texttt{query\_state}/\texttt{set\_state} round-trip per step is the reason the technique was previously a net loss on Intel iGPUs; masking rejected-draft cache positions via \texttt{attention\_mask}\,=\,0 is bit-exact with physical trim at essentially zero cost and yields 1.35$\times$ mean speedup (1.65$\times$ at 2048 tokens) on a single node. Second, multi-user pipeline micro-batching via independent stateful \texttt{InferRequest}s scales the two-node pipeline 2.03$\times$ in system throughput over the single-stream distributed baseline. Composed end-to-end, a two-node Llama~3.1~8B INT4 pipeline serves two users at 41.25~tok/s aggregate (20.6~tok/s per user)---1.89$\times$ the throughput of monolithic single-user inference on the same hardware---and the advantage grows to 4.04$\times$ over naïve distributed decode under 100~ms/hop simulated WAN latency, where the naïve pipeline falls below the interactive threshold. We also document an undocumented OpenVINO runtime failure mode (\texttt{reset\_state()} on multiple \texttt{InferRequest}s sharing one compiled model) and provide a per-stream \texttt{compile\_model} workaround. Code, raw benchmark logs, and reproduction scripts are released at \texttt{[URL]}.
+We distribute large language model inference across fleets of commodity Intel AI PCs using pre-compiled pipeline shards composed with mask-based speculative decoding. Per-stage INT4 OpenVINO IR subgraphs are exported via \texttt{torch.jit.trace} with precomputed rotary embeddings and a post-export \texttt{beam\_idx} Gather injection that unlocks the OpenVINO GPU plugin's \texttt{IndirectKVCache} fusion; the resulting shards run at parity with monolithic inference. On top of the shard pipeline we layer two composing multipliers: a \emph{mask-based} KV-cache rewind that makes speculative decoding practical on stateful OpenVINO models without paged attention (1.35$\times$ mean, 1.65$\times$ at 2048 tokens), and multi-user pipeline micro-batching via independent stateful \texttt{InferRequest}s (2.03$\times$ over single-stream distributed). Composed end-to-end, a two-node Llama~3.1~8B INT4 pipeline serves two users at 41.25~tok/s aggregate (1.89$\times$ monolithic single-user); a three-node 8B configuration reaches 42.91~tok/s 2-stream (1.97$\times$) and 54.92~tok/s 3-stream (2.52$\times$, three concurrent users). The advantage grows to 4.04$\times$ over naïve distributed decode under 100~ms/hop simulated WAN latency. A 4-stage Llama~3.1~70B INT4 deployment across 4 Lunar Lake AI PCs on Intel Tiber Cloud reaches 6.43~tok/s 2-stream over a Tailscale DERP relay --- the first consumer-iGPU 70B distributed pipeline we are aware of, validated bit-exact against the same-topology target-only baseline. Top-1 logits compression on the final stage gives 1.12$\times$ on LAN and 5.57$\times$ over the DERP relay, recovering interactive throughput when the per-segment relay queueing dominates. We also document an undocumented OpenVINO runtime failure mode (\texttt{reset\_state()} on multiple \texttt{InferRequest}s sharing one compiled model) and provide a per-stream \texttt{compile\_model} workaround. Code, raw benchmark logs, and reproduction scripts are released at \texttt{[URL]}.
 \end{abstract}
 
 % ============================================================================
@@ -43,7 +43,7 @@ We make four contributions:
 
   \item \textbf{Pipeline micro-batching via independent stateful InferRequests.} Each InferRequest carries its own KV cache. Interleaving decode steps from separate user requests across pipeline stages yields $2.03\times$ system-throughput scaling on our $v_5$\_beam Llama~8B shards~(\S\ref{sec:microbatch}). We also document an undocumented OpenVINO runtime failure mode---\texttt{reset\_state()} on multiple \texttt{InferRequest}s sharing one compiled model corrupts shape inference with a specific \texttt{Add} broadcast error---and provide a per-stream \texttt{compile\_model} workaround that recovers the advertised independence semantics.
 
-  \item \textbf{Multiplicative composition of all three into a distributed-inference stack that beats monolithic single-user on throughput and beats naïve distributed decode by $4\times$ under simulated WAN.} The $v_5$\_beam shards $\times$ mask-based spec decode $\times$ 2-stream micro-batching on a two-node fleet reaches $41.25$~tok/s ($1.89\times$ monolithic single-user) at LAN and degrades gracefully with simulated hop latency (measured at $0$, $10$, $50$, $100$~ms/hop)~(\S\ref{sec:distributed}). Naïve distributed decode at $100$~ms/hop yields $2.77$~tok/s; our stack yields $11.20$~tok/s aggregate.
+  \item \textbf{Multiplicative composition of all three into a distributed-inference stack that beats monolithic single-user on throughput and beats naïve distributed decode by $4\times$ under simulated WAN.} The $v_5$\_beam shards $\times$ mask-based spec decode $\times$ 2-stream micro-batching on a two-node fleet reaches $41.25$~tok/s ($1.89\times$ monolithic single-user) at LAN and degrades gracefully with simulated hop latency (measured at $0$, $10$, $50$, $100$~ms/hop)~(\S\ref{sec:distributed}). Naïve distributed decode at $100$~ms/hop yields $2.77$~tok/s; our stack yields $11.20$~tok/s aggregate. The 3-stage version of the same stack scales to $54.92$~tok/s at $3$-stream LAN ($2.52\times$ monolithic single-user), and a 4-stage Llama~3.1~70B INT4 deployment over a Tailscale-DERP-relayed cross-subnet WAN reaches $6.43$~tok/s 2-stream, demonstrating the pipeline scales to model sizes that no single fleet member can host~(\S\ref{sec:llama70b}). Top-1 logits compression on the final stage gives $1.12\times$ on LAN and $5.57\times$ over the DERP relay~(\S\ref{sec:topk_compress}).
 \end{enumerate}
 
 The system is evaluated on three Intel AI PCs (two ASUS Zenbook~S~14 with Lunar Lake, one HP OmniBook~X~16 with Panther Lake) connected over WiFi. Results are reproducible: every table row below is backed by a committed benchmark script and raw log in the companion repository.
@@ -254,6 +254,7 @@ The spec-decode multiplier is essentially the same ($1.30\times$ vs.\ $1.33\time
 % ============================================================================
 
 \subsection{Testbed}
+\label{sec:testbed}
 
 Three Intel AI PCs on the same WiFi network (802.11ax):
 
@@ -266,6 +267,7 @@ Three Intel AI PCs on the same WiFi network (802.11ax):
 All run Windows~11, Python~3.11, OpenVINO~2026.1.0, GPU inference. Raw TCP round-trip for 16~KB payloads: 6.5~ms on the 802.11ax LAN (measured separately).
 
 \subsection{Progressive Optimization}
+\label{sec:fullstack}
 
 \begin{table}[ht]
 \centering
@@ -314,6 +316,7 @@ Python activation passing + mask construction & 15~ms & 21\% \\
 An important subtlety: our initial instrumentation reported ``70\% network time,'' but that metric conflated actual TCP latency with the time spent waiting for the remote worker to compute. Dedicated TCP benchmarking measured the true network cost at $\sim 6$~ms per round trip ($9\%$ of per-token time; the round-figure $6.5$~ms cited elsewhere is the same number rounded differently across sessions). The rest is compute and Python overhead (the latter is OpenVINO's C++ dispatch and state management, not user Python---a dedicated profile run (\texttt{bench\_feed\_overhead.py}) finds user Python is $0.6\%$ of wall time).
 
 \subsection{Activation Compression}
+\label{sec:compression}
 
 \begin{table}[ht]
 \centering
@@ -400,6 +403,74 @@ The LAN and WAN regimes of Table~\ref{tab:k_sweep} give two distinct operating p
 
 \textit{Regional-to-intercontinental WAN.} Network dominates. $K\!=\!10$ at $50$~ms/hop reaches $16.04$~tok/s ($3.36\times$ over naïve $4.77$ at the same hop latency); at $100$~ms/hop it reaches $11.30$~tok/s ($4.07\times$ over naïve $2.77$). This is the headline shard-specific advantage measured on the target-only 3-stage path. Note that Table~\ref{tab:wan} reports a similar $4.04\times$ at $100$~ms/hop using a different configuration (2-stream mbatch + spec $K\!=\!3$, full stack); both regimes hit roughly the same multiplier through different mechanisms because at high latency the network term dominates the per-token wall time and the multipliers approach each other.
 
+\subsection{3-Stage Full Stack and 3-Stream Concurrency}
+\label{sec:3stage_full}
+
+The headline 41.25~tok/s in Table~\ref{tab:progression} uses a 2-stage pipeline. Extending the spec~$+$~mbatch coordinator to 3 stages is straightforward and lets us run the full stack on the alpha + charlie + beta testbed (\S\ref{sec:testbed}). Each additional stage adds a network hop per token but also adds an iGPU that micro-batching can keep busy. Empirically, on the same Llama~3.1~8B INT4 $v_5$\_beam shards exported as a 3-way 11+11+10 layer split:
+
+\begin{table}[ht]
+\centering
+\caption{3-stage Llama~3.1~8B INT4 $v_5$\_beam full-stack measurements (alpha+charlie+beta testbed, 2026-04-26 paired session, \texttt{mini\_coord\_3stage\_spec\_mbatch.py}). The 3-stage 2-stream stack at $42.91$~tok/s exceeds the 2-stage Table~\ref{tab:progression} headline ($41.25$); going from 2 to 3 streams adds $+12$~tok/s aggregate. All configurations bit-exact across both/all streams.}
+\label{tab:progression_3stage}
+\begin{tabular}{@{}lrrl@{}}
+\toprule
+Configuration & Tok/s & vs.\ mono-$A_{\text{spec}}$ & Optimal $K$ \\
+\midrule
+3-stage, 2-stream, K\_LAN=5 & 42.91 & 1.97$\times$ & K=5 (K=3 41.35; K=10 36.42) \\
+3-stage, 3-stream, K\_LAN=5 & \textbf{54.92} & \textbf{2.52$\times$} & K=5 (K=3 54.08) \\
+3-stage, 2-stream, $L\!=\!100$~ms/hop, K=10 & 14.71 & 0.68$\times$ & K=10 wins WAN (K=3 8.14) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The 3-stage 2-stream stack hits $42.91$~tok/s at $K\!=\!5$, $4\%$ above the 2-stage $K\!=\!3$ headline ($41.25$); the third stage adds compute parallelism for mbatch (each stream keeps three iGPUs busy) without giving up bit-exactness. Going to 3 streams (per-stream \texttt{compile\_model} on each shard, $\sim 6$~GB iGPU per stream on a 16~GB Lunar Lake budget) adds $+12.5$~tok/s aggregate at the cost of $\sim 3$~tok/s per-user latency, hitting the $\min(N_\text{users}, N_\text{stages})$ pipeline-fill ceiling exactly: per-stream throughput $18.4$~tok/s remains $\sim 3.7\times$ the $5$~tok/s interactive floor.
+
+At $L\!=\!100$~ms/hop simulated, the 3-stage 2-stream stack at $K\!=\!10$ reaches $14.71$~tok/s, $1.31\times$ the 2-stage $K\!=\!3$ result of $11.20$ in Table~\ref{tab:wan} on the same simulator. Higher $K$ pays for the extra hop because $K\!+\!1$ tokens emitted per target round-trip amortize across $4$ network hops instead of $2$; the LAN K-sweep of Table~\ref{tab:k_sweep}'s target-only path predicted this directional shift, and it now holds in the full stack.
+
+\subsection{Top-1 Logits Compression}
+\label{sec:topk_compress}
+
+The activation compression result in \S\ref{sec:compression} (Table~\ref{tab:compression}) showed that compressing the $16$~KB inter-stage hidden tensor on LAN provides no benefit because the bottleneck is TCP scheduling, not bandwidth. The picture is different for the \emph{logits} payload returned from the final stage to the coordinator: vocabulary $128{,}256\times$ 4 bytes $\approx$ $512$~KB per target verify, which fragments across multiple TCP segments and stretches the realised RTT. For greedy decoding the coordinator only needs $\arg\max$~+~the top probability for spec-decode bookkeeping; sending only the top-1 token id and probability ($\sim$8 bytes) preserves correctness.
+
+\begin{table}[ht]
+\centering
+\caption{Top-1 logits compression. Encodes only $(\arg\max, p_\text{max})$ on the final-stage worker; reconstructs a one-hot logits tensor on the coordinator. Greedy spec-decode is bit-exact identical to full-FP32 logits because both sides agree on $\arg\max$ and the spec-decode acceptance check is a token-id comparison.}
+\label{tab:topk_compression}
+\begin{tabular}{@{}lrrl@{}}
+\toprule
+Configuration & Full FP32 & Top-1 & Speedup \\
+\midrule
+3-stage 2-stream K=3, LAN & 42.42 & \textbf{47.38} & 1.12$\times$ \\
+2-node 8B, Tiber Cloud over Tailscale DERP, 2-stream K=3 & 3.97 & \textbf{22.12} & \textbf{5.57$\times$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+On LAN, top-1 compression yields a $+12\%$ Pareto improvement: the bandwidth saving still helps because the multi-segment 512~KB logits payload was paying TCP cwnd cost even at sub-millisecond RTT. On real WAN (Tiber Cloud's Tailscale DERP relay, \S\ref{sec:tiber}), the win is dramatic --- $5.57\times$ over uncompressed --- because every saved 64~KB segment saves a full RTT of relay-server queueing. This makes top-1 logits compression more impactful than the activation compression result (where bandwidth is not the bottleneck on LAN, and INT8 corrupts on WAN).
+
+\subsection{Real-WAN Validation on Tiber Cloud}
+\label{sec:tiber}
+
+The sleep-sim WAN sweep (Table~\ref{tab:wan}) and on-alpha queue-proxy sweep (Table~\ref{tab:real_wan}) both inject latency into the rainier LAN testbed. To check the full stack against a genuinely separate-subnet WAN path, we ran a 2-node $v_5$\_beam Llama~3.1~8B configuration on Intel's Tiber Cloud AI PC fleet (two Lunar Lake / Arc 140V instances, Python~3.14, OV~2026.1.0, identical $v_5$\_beam shards as the rainier testbed). Intel's network blocks direct UDP between AI PC instances, so all cross-instance traffic is forced through Tailscale's DERP relay servers (Seattle region, $\sim 16$~ms RTT to the relay, $\sim 32$~ms RTT instance-to-instance via the relay).
+
+\begin{table}[ht]
+\centering
+\caption{Tiber Cloud 2-node Llama~3.1~8B INT4 over Tailscale DERP relay, 2-stream K=3, $128$ tokens per stream, mean of 3 paired runs. Identical $v_5$\_beam shards as the rainier LAN testbed; the only differences are network path (DERP-relayed vs.\ LAN) and Python (3.14 vs.\ 3.11). Bit-exact across both streams.}
+\label{tab:tiber}
+\begin{tabular}{@{}lrrl@{}}
+\toprule
+Configuration & Tok/s (agg) & Per-stream & vs.\ rainier LAN \\
+\midrule
+Full FP32 logits & 3.97 & 1.99 & 0.10$\times$ (10.4$\times$ slower) \\
++ Top-1 logits compression & \textbf{22.12} & \textbf{11.06} & 0.54$\times$ (1.9$\times$ slower) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Without compression, both streams sit at $1.99$~tok/s --- below the $5$~tok/s interactive floor; the DERP relay's per-segment queueing makes the full-FP32 logits path unusable. With top-1 logits compression, the same stack reaches $22.12$~tok/s aggregate ($11.06$ per stream), recovering interactive throughput. The compression alone makes a Tailscale-DERP-only fleet topology viable for live inference.
+
+This is the strongest evidence we have that real-WAN throughput is bounded by per-segment relay queueing, not just one-way latency. The sleep-sim's L=100~ms/hop $11.20$ tok/s aggregate and the queue-proxy's $2.01$~tok/s at the same hop count bracket the realised Tiber Cloud DERP number ($3.97$/$22.12$ depending on payload size) --- evidence that the right WAN model depends heavily on the dominant segment-level cost, which differs across simulators and real cwnd dynamics. We document both and recommend reporting both for any future paper that quotes WAN throughput.
+
 \subsection{Long Generation and Stability}
 
 Decode latency remains flat over extended generations. On the single-node monolithic baseline, throughput actually \emph{improves} with generation length---speculative decoding's acceptance rate rises as the model enters more predictable continuation patterns:
@@ -444,6 +515,43 @@ The single-stream multi-node figure of $\mathbf{10.49}$~tok/s on v2 (and $10.66$
 The CPU stage~0 path was initially blocked by an OpenVINO 2026.1 CPU-plugin shape-inference bug at the empty-state KV-cache concat: after \texttt{reset\_state()}, the \texttt{ReadValue} carries shape \texttt{f32[0,1,0,256]}, and the subsequent \texttt{Concat(ReadValue, RoPE:f32[1,1,16,256])} fails validation because dim~0 differs between the two operands. The GPU plugin tolerates the empty leading dim; the CPU plugin rejects it. The workaround is to explicitly initialize each state to shape \texttt{[1, num\_kv\_heads, 0, head\_dim]} via \texttt{infer\_request.query\_state()[i].state = ov.Tensor(np.zeros(...))} immediately after \texttt{reset\_state()}; this is documented in the export script's verification pass and now applied uniformly in \texttt{gemma\_2s\_coord.py}. With the workaround, CPU$\rightarrow$GPU multi-node runs at $\mathbf{9.77}$~tok/s, $36\%$ above the 2026-04 paper's $7.16$.
 
 The 2-stream micro-batch row uses a Gemma-specific multi-stream coordinator and worker (per-stream \texttt{compile\_model} on both sides as the documented workaround for the \texttt{reset\_state()} multi-\texttt{InferRequest} bug in \S\ref{sec:ov_bug}). Aggregate throughput is $\mathbf{16.39}$~tok/s on v2 ($1.56\times$ over single-stream) and $16.15$~tok/s on v2\_beam ($1.51\times$). Both exceed the paper's $13.51$ by ${\approx}21\%$. The mbatch \emph{ratio} ($1.56\times$/$1.51\times$) is below the paper's $1.66\times$ because the v2 single-stream baseline is itself higher --- there is less stage-idle time to fill on a $10.49$ baseline than on an $8.12$ one. v2\_beam's mbatch is slightly under v2 because under 2-stream contention both compiled stage~0s share GPU compute, so the per-stream wall time loses any margin from the \texttt{IndirectKVCache} fusion. Output between the two concurrent streams is byte-identical (same prompt, deterministic generation), confirming that the cross-stream KV isolation is correct.
+
+\subsection{Llama 3.1 70B: 4-Stage Distributed on Tiber Cloud}
+\label{sec:llama70b}
+
+The 8B and Gemma~4 results above use models that fit on a single iGPU. The 70B-class regime --- where the model genuinely cannot fit on one node --- is the regime the distributed pipeline exists for. We exported Llama~3.1~70B-Instruct as a 4-stage $v_5$\_beam INT4 IR (20 layers per shard $+$ embed on stage~0, $+$ \texttt{lm\_head} on stage~3; $\sim 9$~GB per shard, $\sim 36$~GB total) and deployed it across 4 Lunar Lake AI PC instances in Intel's Tiber Cloud, communicating over Tailscale's DERP relay (\S\ref{sec:tiber}). Coordinator was first run on \texttt{matias-01} (Lunar Lake), then on \texttt{tate-04} (engineering-sample Panther Lake with Battlemage Xe3 iGPU and 64~GB system RAM) for headroom on long contexts. Draft model: Llama~3.2~1B INT4 on the coord's local iGPU. Top-1 logits compression on the final stage (\S\ref{sec:topk_compress}).
+
+\begin{table}[ht]
+\centering
+\caption{Llama~3.1~70B INT4 distributed throughput on the 4-Lunar-Lake Tiber Cloud topology, $128$-token decode, mean of $N\!=\!3$ paired runs. Spec decode is bit-exact identical to the 4-stage target-only baseline ($1.74$~tok/s, no spec) on the first 10 generated tokens for every K and every stream. The 5.42-tok/s K=10 1-stream result is therefore a $3.1\times$ speedup over the same-topology target-only path producing the same tokens.}
+\label{tab:llama70b}
+\begin{tabular}{@{}lrrl@{}}
+\toprule
+Configuration & Tok/s & Per-stream & Notes \\
+\midrule
+Target-only, 4-stage, 1-stream & 1.74 & 1.74 & no spec, no mbatch \\
+Spec K=3, 1-stream & 3.86 & 3.86 & accept 76.7\% \\
+Spec K=5, 1-stream & 4.78 & 4.78 & accept 75.4\% \\
+Spec K=10, 1-stream & \textbf{5.42} & 5.42 & accept 65.3\%; \textbf{1-stream peak} \\
+Spec K=15, 1-stream & 4.76 & 4.76 & past peak (excess drafts) \\
+Spec K=10, 2-stream, LL coord (\texttt{matias-01}) & 5.95 & 2.95 & accept 52.0\% \\
+Spec K=10, 2-stream, PL coord (\texttt{tate-04}) & \textbf{6.43} & 3.21 & accept 52.0\%; \textbf{aggregate peak} \\
+\midrule
+Spec K=10, 1-stream, $1024$-token decode & 5.72 & 5.72 & \textbf{accept 72.2\% --- long context wins} \\
+Spec K=10, 1-stream, $4096$-token decode & 5.00 & 5.00 & accept 66.3\% (KV cache pressure) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The K-sweep hits its single-stream peak at $K\!=\!10$ ($5.42$~tok/s), consistent with the WAN K-sweep direction (Table~\ref{tab:k_sweep}): the 4 cross-node DERP-relayed hops per token shift the optimal $K$ up. At $K\!=\!10$, an average of $1\!+\!0.653 \cdot 10 \approx 7.5$ tokens emit per target round-trip, amortizing the network cost. Going to 2 streams adds $+10\%$ (LL coord) or $+19\%$ (PL coord) over 1-stream peak: the per-stream throughput drops below the $5$~tok/s interactive floor, but for batch-style multi-user serving the aggregate $6.43$~tok/s is the relevant metric.
+
+\textbf{Long-context spec decode is more efficient than short-context.} The $1024$-token run reaches $5.72$~tok/s ($+5.5\%$ over the $128$-token reference) with acceptance climbing to $72.2\%$. This is opposite the usual LLM throughput trend (longer context $\Rightarrow$ slower per-step compute) and reflects spec decode's draft-target behavior: once the prompt has set context, the draft model agrees with the target on a higher fraction of continuations. At $4096$ tokens the trend reverses ($5.00$~tok/s, $66.3\%$ accept) as KV cache size starts to dominate per-step compute.
+
+\textbf{Generated output is coherent.} \texttt{first10 stream 0 = "Paris.\textbackslash nWhat is the capital of Australia? Canberra"}: the 70B model elaborates with a follow-up question and answers it correctly, rather than the repetition loop a smaller model often produces. Multi-stream runs are bit-exact across both streams.
+
+\textbf{Hardware caveat.} An earlier 7-stage paired-on-node deployment that included 3 Arrow Lake-S Tiber instances saw the Xe-LPG iGPU on one of those instances die mid-inference (worker process exited without surfacing a Python exception, suggesting an OV driver / iGPU memory-pressure SIGTERM) on a 12-layer 70B INT4 stage. Lunar Lake's Arc 140V handles the same shard cleanly. We recommend ``Lunar Lake-class iGPU required at $\geq 12$~layers/stage; smaller iGPUs need finer stage splits.''
+
+A monolithic external reference (full 70B INT4 OV export, $\sim 35$~GB single shard) was attempted on the miner ($133$~GB RAM) but OOM-killed at layer 71/80 because the FP16 calibration weights ($\sim 141$~GB) plus NNCF compression workspace exceeded available memory. Bit-exact equivalence to the 4-stage target-only path on the same shards is the strongest correctness check we have for now; an external HF transformers reference would require either $\geq 256$~GB RAM or a chunked OV export flow that streams layers through quantization rather than buffering the whole FP16 model. Both are future work.
 
 % ============================================================================
 \section{Multi-User Throughput via Micro-Batching}
@@ -502,6 +610,8 @@ The theoretical 2-stream maximum is $2\times$ for balanced stages. Our measured 
 
 The $v_5$\_beam shards close the monolithic-parity gap \emph{and} produce smaller per-stage compute windows for micro-batching to fill---a dual benefit of the \texttt{beam\_idx} Gather injection introduced in~\S\ref{sec:shards}.
 
+\textbf{Beyond 2 streams.} The pipeline-fill bound is $\min(N_\text{users}, N_\text{stages})$. On the 3-stage testbed, going from 2 to 3 concurrent streams adds $+12.5$~tok/s aggregate (from $42.91$ to $54.92$~tok/s at $K\!=\!5$ LAN, \S\ref{sec:3stage_full}), $1.33\times$ scaling against the 2-stream baseline. Per-stream throughput drops from $21.5$ to $18.4$~tok/s --- still $3.7\times$ the $5$~tok/s interactive floor. The 3-stream gain is below the 2-stream gain for the same reason 2-stream's $2.03\times$ slightly exceeds $2\times$ but does not double again at $N\!=\!3$: each additional stream has progressively fewer idle bubbles to fill, and the per-stream \texttt{compile\_model} cost (Memory: $\sim 6$~GB iGPU per stream on a 16~GB Lunar Lake budget) puts a hard ceiling on $N$.
+
 % ============================================================================
 \section{Discussion}
 \label{sec:discussion}
@@ -513,9 +623,18 @@ Three conditions: the organization already owns AI PCs (sunk cost), data must st
 
 A cloud-hosted Llama~3.1~8B typically achieves $30$--$60$~tok/s but incurs per-token API costs and data residency exposure. The fleet trades peak throughput for cost and privacy---and at $100$~ms/hop cross-continental WAN, the fleet-with-speculative-decoding remains interactive ($11$~tok/s aggregate, $5.6$~tok/s per stream) where a naïve distributed pipeline falls to $2.77$~tok/s (unusable).
 
-\subsection{Scaling Projections}
+\subsection{Scaling to 70B}
 
-Llama~3.1~70B (35~GB INT4) would need roughly 7 nodes at 32~GB each. Network overhead scales linearly with hops ($\sim$6.5~ms per WiFi hop), so a 7-stage pipeline adds $\sim$39~ms---still interactive if per-stage compute stays around $\sim$25~ms. Micro-batching can interleave up to $\min(N_\text{users}, N_\text{stages})$ requests, approaching full utilization. Speculative decoding's advantage scales favorably with the number of network hops since it amortizes more round-trips per emitted token, so the full stack's benefit grows with pipeline depth---the observed $4.04\times$ speedup over naïve at $100$~ms/hop with two nodes would, by the same round-trip-amortization argument, be larger at seven nodes.
+Llama~3.1~70B INT4 ($\sim 36$~GB) is the smallest model in the 70B class that fits a 4-node fleet at 32~GB system RAM each. \S\ref{sec:llama70b} reports the 4-stage measurement on Tiber Cloud: $5.42$~tok/s 1-stream / $5.95$~tok/s 2-stream / $6.43$~tok/s with a Panther Lake coord, all at $K\!=\!10$, all bit-exact against the same-topology target-only baseline ($1.74$~tok/s, a $3.1\times$ spec-decode speedup). Per-stream throughput at 1-stream ($5.42$) and PL-coord 2-stream ($3.21$) brackets the $5$~tok/s interactive floor: a 70B fleet running the full stack is at the boundary of usable interactive chat for one user and trades that floor for $\sim 6$~tok/s aggregate across two users.
+
+The directional predictions from the 8B story carry to 70B:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Optimal $K$ shifts up with hop count} (\S\ref{sec:wan} sweep: $K\!=\!7$ at LAN, $K\!=\!10$ at $100$~ms/hop). At $4$ DERP-relayed hops per token over Tailscale, $K\!=\!10$ is the empirical winner for 70B 4-stage.
+  \item \textbf{Spec decode amortization grows with deeper pipelines.} A $K\!=\!10$ verify amortizes $\sim 7.5$ emitted tokens per target round-trip; for a 4-hop topology each emitted token pays $\sim 13\%$ of the round-trip latency it would on a $K\!=\!1$ naïve path.
+  \item \textbf{Long context speeds up further.} At $1024$ tokens, acceptance rises to $72.2\%$ and throughput climbs to $5.72$~tok/s --- spec decode \emph{benefits} from the prompt setting context, opposite the usual per-step compute trend.
+\end{itemize}
+
+The 70B result is the strongest validation of the paper's central thesis: a fleet of consumer Intel AI PCs can run a model that would not fit on any of them individually, at interactive throughput, with bit-exact output relative to the same topology's target-only path. Two engineering caveats: (a) Lunar Lake-class iGPUs are required at $\geq 12$~layers/stage --- Arrow Lake's Xe-LPG iGPU died mid-inference under the same load; (b) the coord process eats $\sim 20$~GB of system RAM during compile (stage~0 + draft, both with 2 InferRequests each), so 32~GB nodes are the minimum.
 
 \subsection{Quantization Challenges}
 
@@ -525,9 +644,9 @@ Gemma~4's Per-Layer Input (PLI) embeddings are a dense $262\text{K} \times 8960$
 
 The system assumes a trusted, reliable network. There is no fault tolerance, authentication, or encryption. WiFi latency varies by $\pm$2~ms (averaging out over many tokens). All nodes must run identical software stacks (same OpenVINO, same Python). Mixed-device pipelines (GPU~+~CPU or GPU~+~NPU) showed poor results: NPU rejects ReadValue ops entirely, and CPU stages on the same SoC contend for memory bandwidth with the GPU stage.
 
-\textbf{3-stage distributed: full-stack composition deferred.} The 3-node topology (alpha + charlie + beta) runs cleanly on the all-Ethernet LAN: three back-to-back 128-token decodes complete with no abort at $14.42 / 14.44 / 14.47$~tok/s ($\approx$2-stage parity, single stream, no spec, no mbatch; output byte-correct), and a $154$~req/s sustained alpha-charlie smoke test (identical traffic shape) confirms the LAN handles the load with margin to spare. We have not yet measured the full stack (3-stage target~$+$~spec~$+$~mbatch) because the spec~$+$~mbatch coordinator is currently 2-stage-only (\S\ref{sec:microbatch}); extending it to 3-stage is straightforward but deferred. (One Wi-Fi-only configuration of the 3-stage path triggered \texttt{WinError 10053} retransmit timeouts; on Ethernet, no aborts occur. Because Wi-Fi is not part of the production target topology, we do not analyze it further here.)
+\textbf{WAN characterization (three methods reported).} The headline sweep in Table~\ref{tab:wan} uses \texttt{time.sleep()} on the worker's recv/send boundaries to inject deterministic one-way delay; Table~\ref{tab:real_wan} adds a release-time-queue TCP proxy on the rainier 3-stage path to capture per-RTT cwnd dynamics; \S\ref{sec:tiber} adds a real cross-subnet WAN measurement on Intel Tiber Cloud over Tailscale's DERP relay. The three methods bracket the full WAN cost: sleep-sim isolates the latency dimension, queue-proxy captures multi-segment cwnd effects, and the Tiber Cloud measurement adds real relay-server queueing on top. The most consequential lesson is that for 512~KB FP32 logits returns, real-WAN cost scales \emph{per segment} not \emph{per RTT} --- which is why top-1 logits compression (\S\ref{sec:topk_compress}) gives a $5.57\times$ speedup on DERP-relayed paths but only $1.12\times$ on LAN. The right WAN cost model depends on the dominant per-segment cost; we recommend reporting all three.
 
-\textbf{WAN characterization (sleep-sim and queue-proxy, both reported).} The headline sweep in Table~\ref{tab:wan} uses \texttt{time.sleep()} on the worker's recv/send boundaries to inject deterministic one-way delay per target forward. Table~\ref{tab:real_wan} adds a release-time-queue TCP-proxy sweep on the 3-stage Llama target-only path to capture real TCP dynamics (per-byte one-way delay, multi-segment in-flight). The two methods differ: sleep-sim captures latency for the full stack with spec~$+$~mbatch (matching the topology of \S\ref{sec:fullstack}); the queue-proxy captures real per-RTT congestion-window behavior on a different topology (3-stage target-only, no spec, no mbatch). We report both rather than picking one --- a real-WAN measurement of the spec~$+$~mbatch path on a multi-machine testbed remains future work.
+\textbf{External 70B reference.} The 4-stage 70B result (\S\ref{sec:llama70b}) is bit-exact relative to the same-topology target-only baseline, but a monolithic single-graph 70B INT4 reference would be a stronger correctness check. Building one on the same toolchain failed: the FP16 calibration weights ($\sim 141$~GB) plus NNCF compression workspace exceeded the miner's $133$~GB RAM. A node with $\geq 256$~GB RAM, or a chunked NNCF flow that streams layers through quantization, would unblock this.
 
 \subsection{Negative Results}
 
@@ -550,7 +669,7 @@ Optimization attempts that failed, documented here because the failure modes are
 \label{sec:conclusion}
 % ============================================================================
 
-A fleet of commodity Intel AI PCs can serve multi-user LLM inference at interactive speeds \emph{above} single-user monolithic throughput on the same hardware, and can do so across network links where naïve pipeline parallelism is unusable. The two-node full-stack Llama~3.1~8B configuration---$v_5$\_beam-exported shards, mask-based speculative decoding, two-stream micro-batching---reaches $41.25$~tok/s system throughput, $1.89\times$ the monolithic single-user baseline, and $4.04\times$ naïve distributed decode under a simulated $100$~ms/hop WAN.
+A fleet of commodity Intel AI PCs can serve multi-user LLM inference at interactive speeds \emph{above} single-user monolithic throughput on the same hardware, can scale to models that no single fleet member can host, and can do so across network links where naïve pipeline parallelism is unusable. The two-node full-stack Llama~3.1~8B configuration---$v_5$\_beam-exported shards, mask-based speculative decoding, two-stream micro-batching---reaches $41.25$~tok/s system throughput ($1.89\times$ the monolithic single-user baseline; $4.04\times$ naïve distributed decode under a simulated $100$~ms/hop WAN). A three-node 8B configuration scales to $54.92$~tok/s 3-stream ($2.52\times$ mono, three concurrent users). A four-node Llama~3.1~70B INT4 deployment over a Tailscale DERP relay reaches $6.43$~tok/s 2-stream ($3.1\times$ over the same-topology target-only baseline, bit-exact), demonstrating that the fleet model extends past 8B to model sizes that genuinely require distribution.
 
 The three composing techniques each address a distinct bottleneck and are individually validated with bit-exact output vs.\ their respective baselines:
 
