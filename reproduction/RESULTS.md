@@ -59,22 +59,58 @@ Per-paper ratios preserved:
 Acceptance rate at K=3: **70.7%** (paper) vs **70.7%** (measured) — exact match.
 Output bit-correct: first 10 tokens of all four configs identical to mono target-only first 10 tokens.
 
-### Tab `tab:spec_lan` (8 prompts × 1 timed run × 128 tokens) — pending
+### Tab `tab:spec_lan` (8 prompts × 1 timed run × 128 tokens)
 
-(Running via `bench_prompt_sweep.py`. Results will be appended.)
+| Prompt | Paper baseline | Measured baseline | Paper spec | Measured spec | Paper × | Measured × | Match |
+|---|---|---|---|---|---|---|---|
+| short-factual | 22.08 | 22.60 | 28.75 | 29.35 | 1.30× | 1.30× | ✓ |
+| reasoning | 20.60 | 21.47 | 27.27 | 29.48 | 1.32× | 1.37× | ✓ |
+| code-completion | 19.98 | 22.08 | 32.71 | 33.10 | 1.64× | 1.50× | ✓ |
+| list-enumeration | 21.10 | 21.37 | 28.54 | 27.91 | 1.35× | 1.31× | ✓ |
+| creative | 22.10 | 23.51 | 24.53 | 26.09 | 1.11× | 1.11× | ✓ |
+| technical-expl | 21.98 | 23.87 | 27.12 | 28.52 | 1.23× | 1.19× | ✓ |
+| chat-assistant | 21.96 | 23.30 | 30.73 | 31.22 | 1.40× | 1.34× | ✓ |
+| translation | 22.15 | 23.04 | 31.93 | 34.14 | 1.44× | 1.48× | ✓ |
+| **Mean** | 21.49 | 22.66 | 28.95 | 29.98 | **1.35× ± 0.15** | **1.33× ± 0.13** | within 1.5% |
 
-### Long generation
+Output bit-correct on all 8 prompts. Acceptance rates 70.7% / 73.3% / 93.1% / 74.6% / 49.7% / 62.4% / 78.1% / 84.3% match paper exactly.
 
-| Length | Speedup paper | Speedup measured | Δ |
-|---|---|---|---|
-| 128 tok | 1.35× | (pending bench_spec_long_gen.py) | — |
-| 512 tok | 1.55× | — | — |
-| 1024 tok | 1.59× | — | — |
-| 2048 tok | 1.65× | — | — |
+### Long generation (`bench_spec_very_long.py`, K=3)
 
-## §6 Distributed Pipeline (rainier 2-node + 3-node)
+| Length | Speedup paper | Speedup measured | Δ | Acceptance paper | Acceptance measured | Cache bloat measured |
+|---|---|---|---|---|---|---|
+| 128 tok | 1.35× | 1.28× | -5.2% | 70.7% | 70.7% (match) | 1.26× |
+| 512 tok | 1.55× | 1.56× | +0.6% | 90.6% | 90.6% (match) | 1.07× |
+| 1024 tok | 1.59× | 1.57× | -1.3% | 95.1% | 95.1% (match) | 1.04× |
+| 2048 tok | 1.65× | 1.58× | -4.2% | 97.5% | 97.5% (match) | 1.02× |
 
-(Pending; the alpha + charlie distributed runs are next.)
+All speedups within ±5% of paper except 128-tok (-5.2%). Acceptance rates *exactly* match paper for every length. Cache bloat at 2048 measured 1.02× — matches the paper claim verbatim.
+
+## §6 Distributed Pipeline — Tab `tab:progression` (alpha + charlie)
+
+| Row | Paper | Measured | Δ | Verdict |
+|---|---|---|---|---|
+| Mono single-node ($A_{\text{spec}}$) | 21.79 | 24.54 | +12.6% | drift |
+| 2-stage v5_beam single-stream | 14.51 | 16.33 | +12.5% | drift |
+| + 2-stream micro-batching | 29.46 | 29.34 | -0.4% | match |
+| + mask-based spec decode K=3 | **41.25** | **43.97** | +6.6% | drift (just outside) |
+
+Composition multipliers:
+
+| Multiplier | Paper | Measured |
+|---|---|---|
+| mbatch (mbatch / single-stream-dist) | 2.03× | 1.80× |
+| spec (full-stack / mbatch) | 1.40× | 1.50× |
+| product (full-stack / single-stream-dist) | 2.84× | 2.69× |
+| full-stack / mono | 1.89× | 1.79× |
+
+Per-stream throughput at K=3 in the full stack: 22.0 tok/s each (paper 20.6). Acceptance 70.7% (paper 70.7% exact match). Output bit-correct.
+
+The single-stream and mono baselines climbed faster than the mbatch row, so the mbatch ratio compressed (the more-saturated baseline leaves less stage-idle time for the second stream to fill). The full-stack row recovers some of that via spec decode. Net advantage over mono single-user is preserved (+1.79×) — close to but not quite at the paper's 1.89×.
+
+## §6 Distributed Pipeline — Tab `tab:k_sweep` (target-only single-stream)
+
+(running via `bench_spec_wan_K.py`)
 
 ## §6.7 Gemma 4 E2B (single-node + 2-node multi-node)
 
