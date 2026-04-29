@@ -31,10 +31,10 @@ Conclusion of §4 holds: `beam_idx` Gather injection brings v5_beam shards withi
 |---|---|---|---|---|
 | Mono A_spec reference | 21.79 | 24.28 | +11.4% | drift |
 | v5_beam 1-stage | 22.08 | 23.93 | +8.4% | drift |
-| v5_beam 2-stage (16+16) | 19.41 | (pending) | — | — |
+| v5_beam 2-stage (16+16) | 19.41 | **20.56** ± 0.10 | +5.9% | match (just within tolerance) |
 | v5_beam 3-stage (11+11+10) | 19.79 | 21.56 | +8.9% | drift |
 
-3-stage in-process matches Tab 5 row B (same script, `bench_spec_matrix.py`). 2-stage in-process not yet measured (would need a 2-stage version of bench_spec_matrix's ShardedMaskedReq).
+3-stage in-process matches Tab 5 row B (same script, `bench_spec_matrix.py`). 2-stage in-process measured 2026-04-29 with `bench_v5_2stage_inproc.py` (vendored alongside this RESULTS.md): 5-run mean 20.56 ± 0.10 tok/s.
 
 ## §5 Speculative Decoding
 
@@ -165,7 +165,13 @@ Topology: matias-01 (LL coord + stage_0 + draft 1B) → matias-02 (stage_1) → 
 | Spec K=5 1-stream | 4.78 | **3.96** | -17.2% | drift (slower) | 75.4% |
 | Spec K=10 1-stream | 5.42 | **4.69** | -13.5% | drift (slower) | 65.3% |
 | Spec K=15 1-stream | 4.76 | **4.29** | -9.9% | drift (slower) | 51.4% |
-| Spec K=10 2-stream LL coord | 5.95 | _skipped_ (pawan-01 OpenCL CL_INVALID_EVENT after worker recompile w/ NUM_STREAMS=2; reboot needed; 1-stream K-sweep already validates the structural claim) | — | — | — |
+| Spec K=10 2-stream LL coord | 5.95 | _attempted; degraded_ (matias-02 GPU state degraded across multiple compile cycles, NUM_STREAMS=2 worker stuck in compile; 1-stream rows below cleanly captured) | — | — | — |
+| Spec K=10 2-stream PL coord (tate-04) | 6.43 | _not re-attempted_ (PL coord requires same workers; same compile constraints) | — | — | — |
+| Target-only 1-stream (no spec, K=0) | 1.74 | **1.40** | -19.5% | drift slower | — |
+| Spec K=10 1-stream MAX_TOKENS=1024 | 5.72 | **4.13** | -27.8% | drift slower | 72.2% |
+| Spec K=10 1-stream MAX_TOKENS=4096 | 5.00 | _not re-measured_ (would take ~16 min/run on current rate) | — | — | — |
+
+Spec speedup vs target-only (measured): K=3 → 2.43×, K=5 → 2.83×, K=10 → 3.35×, K=15 → 3.06×. Paper's headline ratios were K=3 → 2.22×, K=5 → 2.75×, K=10 → 3.11×, K=15 → 2.74× — the spec-decode multiplier on the new measurement window is *more favorable* than the paper despite the slower absolute throughputs, because the K=0 baseline drifted slower in proportion.
 
 K-sweep peak at K=10 reproduces the paper's structural finding (peak ≠ K=3). Bit-exact decode confirmed: stream 0 first 10 tokens [12366, 198, 3923, 374, 279, 6864, 315, 10057, 30, 20437] identical across all four K values. Acceptance rates monotonically decay as K grows (76.7% → 51.4%), again consistent with paper.
 
