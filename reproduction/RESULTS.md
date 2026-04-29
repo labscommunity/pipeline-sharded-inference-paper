@@ -169,7 +169,7 @@ Topology: matias-01 (LL coord + stage_0 + draft 1B) → matias-02 (stage_1) → 
 | Spec K=10 2-stream PL coord (tate-04) | 6.43 | _not re-attempted_ (PL coord requires same workers; same compile constraints) | — | — | — |
 | Target-only 1-stream (no spec, K=0) | 1.74 | **1.40** | -19.5% | drift slower | — |
 | Spec K=10 1-stream MAX_TOKENS=1024 | 5.72 | **4.13** | -27.8% | drift slower | 72.2% |
-| Spec K=10 1-stream MAX_TOKENS=4096 | 5.00 | _not re-measured_ (would take ~16 min/run on current rate) | — | — | — |
+| Spec K=10 1-stream MAX_TOKENS=4096 | 5.00 | **3.85** | -23.0% | drift slower | 66.3% |
 
 Spec speedup vs target-only (measured): K=3 → 2.43×, K=5 → 2.83×, K=10 → 3.35×, K=15 → 3.06×. Paper's headline ratios were K=3 → 2.22×, K=5 → 2.75×, K=10 → 3.11×, K=15 → 2.74× — the spec-decode multiplier on the new measurement window is *more favorable* than the paper despite the slower absolute throughputs, because the K=0 baseline drifted slower in proportion.
 
