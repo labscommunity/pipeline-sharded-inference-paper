@@ -158,7 +158,7 @@ $v_5$\_beam, 3-stage (11+11+10)  & 21.56 & 0.89$\times$ \\
 \end{tabular}
 \end{table}
 
-Per-stage splitting costs $\sim$11--13\% on a single machine relative to $A_{\text{spec}}=24.28$; the per-stage GEMMs are smaller, reducing XVE occupancy (measured $60.1\%$ on mono vs.\ $43.6\%$ on 3-stage via VTune \texttt{gpu-hotspots}, with identical top-kernel counts), and the Python-level \texttt{hidden\_states.astype(np.float32)} cast between stages is not free. This gap is structural: smaller per-stage problems cannot saturate the GPU the way a single large problem does. We return to how to recover this cost (and then some) via multi-user micro-batching in~\S\ref{sec:microbatch} and via speculative decoding in~\S\ref{sec:spec}.
+Per-stage splitting costs ${\sim}11$--$15\%$ on a single machine relative to $A_{\text{spec}}=24.28$ (1-stage is essentially at parity, 2-stage at $15\%$ overhead, 3-stage at $11\%$); the per-stage GEMMs are smaller, reducing XVE occupancy (measured $60.1\%$ on mono vs.\ $43.6\%$ on 3-stage via VTune \texttt{gpu-hotspots}, with identical top-kernel counts), and the Python-level \texttt{hidden\_states.astype(np.float32)} cast between stages is not free. This gap is structural: smaller per-stage problems cannot saturate the GPU the way a single large problem does. We return to how to recover this cost (and then some) via multi-user micro-batching in~\S\ref{sec:microbatch} and via speculative decoding in~\S\ref{sec:spec}.
 
 \subsection{Methodology}
 
