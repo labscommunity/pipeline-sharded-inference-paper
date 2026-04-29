@@ -1,6 +1,6 @@
 # Pre-Compiled Pipeline Shards for Distributed LLM Inference on Intel AI PC Fleets
 
-**Tate Berenbaum** (Community Labs) and **Muthiah Venkatachalam** (Intel Corporation)
+**Tate Berenbaum** (Community Labs) and **Muthaiah Venkatachalam** (Intel Corporation)
 
 > We distribute large language model inference across fleets of commodity Intel AI PCs
 > using pre-compiled pipeline shards composed with mask-based speculative decoding. Per-stage
@@ -43,7 +43,7 @@ The compiled PDF will be written to `main.pdf`.
 ```bibtex
 @article{berenbaum2026shards,
   title={Pre-Compiled Pipeline Shards for Distributed {LLM} Inference on Intel {AI} {PC} Fleets},
-  author={Berenbaum, Tate and Venkatachalam, Muthiah},
+  author={Berenbaum, Tate and Venkatachalam, Muthaiah},
   journal={arXiv preprint arXiv:XXXX.XXXXX},
   year={2026}
 }
