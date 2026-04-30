@@ -467,15 +467,15 @@ The sleep-sim WAN sweep (Table~\ref{tab:wan}) and on-alpha queue-proxy sweep (Ta
 \toprule
 Configuration & Tok/s (agg) & Per-stream & vs.\ rainier LAN \\
 \midrule
-Full FP32 logits & 3.97 & 1.99 & 0.10$\times$ (10.4$\times$ slower) \\
-+ Top-1 logits compression & \textbf{22.12} & \textbf{11.07} & 0.54$\times$ (1.9$\times$ slower) \\
+Full FP32 logits & 2.80 & 1.40 & 0.06$\times$ (15.7$\times$ slower) \\
++ Top-1 logits compression & \textbf{22.88} & \textbf{11.44} & 0.52$\times$ (1.9$\times$ slower) \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Without compression, both streams sit at $1.99$~tok/s --- below the $5$~tok/s interactive floor; the DERP relay's per-segment queueing makes the full-FP32 logits path unusable. With top-1 logits compression, the same stack reaches $22.12$~tok/s aggregate ($11.06$ per stream), recovering interactive throughput. The compression alone makes a Tailscale-DERP-only fleet topology viable for live inference.
+Without compression, both streams sit at $1.40$~tok/s --- well below the $5$~tok/s interactive floor; the DERP relay's per-segment queueing makes the full-FP32 logits path unusable. With top-1 logits compression, the same stack reaches $22.88$~tok/s aggregate ($11.44$ per stream), recovering interactive throughput. The compression alone makes a Tailscale-DERP-only fleet topology viable for live inference.
 
-This is the strongest evidence we have that real-WAN throughput is bounded by per-segment relay queueing, not just one-way latency. The three WAN methods do not converge on a single number, and they shouldn't: at $L\!=\!100$~ms/hop the 2-stage sleep-sim (Table~\ref{tab:wan}) reports $11.20$~tok/s; the 3-stage queue-proxy at the same hop latency (Table~\ref{tab:real_wan}) reports $2.01$; the Tiber DERP run at $\sim 16$~ms relay RTT (this section) reports $3.97$ uncompressed and $22.12$ with top-1 compression. Each method makes the dominant cost something different --- sleep-sim isolates the latency dimension, queue-proxy charges per chunk through a per-byte-delayed forwarder, DERP charges per packet through a real relay server with its own queueing. For any future paper that quotes WAN throughput we recommend reporting more than one method and identifying which per-segment cost dominates.
+This is the strongest evidence we have that real-WAN throughput is bounded by per-segment relay queueing, not just one-way latency. The three WAN methods do not converge on a single number, and they shouldn't: at $L\!=\!100$~ms/hop the 2-stage sleep-sim (Table~\ref{tab:wan}) reports $11.20$~tok/s; the 3-stage queue-proxy at the same hop latency (Table~\ref{tab:real_wan}) reports $2.01$; the Tiber DERP run at ${\sim}16$~ms relay RTT (this section) reports $2.80$ uncompressed and $22.88$ with top-1 compression. Each method makes the dominant cost something different --- sleep-sim isolates the latency dimension, queue-proxy charges per chunk through a per-byte-delayed forwarder, DERP charges per packet through a real relay server with its own queueing. For any future paper that quotes WAN throughput we recommend reporting more than one method and identifying which per-segment cost dominates.
 
 \subsection{Long Generation and Stability}
 
