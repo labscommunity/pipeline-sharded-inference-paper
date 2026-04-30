@@ -27,3 +27,6 @@ main.pdf
 
 # Thumbnails
 ._*
+
+# Raw run logs from local reproduction sessions (supporting evidence for reproduction/RESULTS.md)
+local_logs/
