@@ -113,5 +113,13 @@ available in this repository:
   on both coordinator and worker)
 - `reproduction/scripts/coord/gemma_2s_mbatch_coord.py`
 
-We were unable to find an existing report of this issue in the OpenVINO issue tracker
-as of 2026-06.
+## Pre-filing checklist (status as of 2026-06-11)
+
+- [x] Latest released OpenVINO checked: **2026.2.0** (`pip index versions openvino`,
+  2026-06-11) — the bug was observed on both 2026.1.0 and 2026.2.0, so the affected
+  list already includes the latest release.
+- [x] Prior-art search (2026-06-11): `gh search issues --repo=openvinotoolkit/openvino`
+  for `reset_state InferRequest`, `reset_state stateful`, `broadcast_merge_into Add`,
+  and `multiple InferRequest state` — no existing report found.
+- [ ] Before filing, re-confirm on whatever OpenVINO release is current at filing time
+  (re-run the repro above on an Arc iGPU machine) and re-search the tracker.
