@@ -4,91 +4,136 @@ This bug was documented in an earlier draft of the paper (former §7.2, "An undo
 OpenVINO constraint") and moved here so it can be filed as an upstream issue instead.
 It is referred to as **Discovery #21** elsewhere in this reproduction package.
 
+> **2026-06-17 update — corrected reproduction.** The earlier "minimal repro" in this
+> file was **single-threaded and did not actually reproduce the bug**. On re-test it
+> ran cleanly on OV 2026.1.0 / 2026.2.0 / 2026.2.1 across several models. The real
+> trigger (recovered from the original `rainier` discovery, `DISCOVERIES.md #21`) is
+> **concurrent, interleaved** driving of sibling `InferRequest`s sharing one
+> `CompiledModel`. With a concurrent harness the bug reproduces reliably — and is
+> **still present on the latest release, OV 2026.2.1** (see hit-rate below). A clean,
+> self-contained repro on a public model is at
+> `reproduction/scripts/repro_reset_state_concurrent.py`.
+
 ---
 
 ## Title
 
-`[Bug] reset_state() on one InferRequest corrupts shape inference for sibling InferRequests created from the same CompiledModel (stateful model, GPU plugin)`
+`[Bug] Concurrent reset_state() across sibling InferRequests of one CompiledModel corrupts shape inference (stateful model, GPU plugin)`
 
 ## System information
 
-- OpenVINO: 2026.1.0 and 2026.2 (both affected)
-- Devices: Intel Arc B390 iGPU (Panther Lake, Core Ultra X7 358H), Intel Arc 140V iGPU
-  (Lunar Lake, Core Ultra 7 258V) — GPU plugin
+- OpenVINO: **2026.1.0, 2026.2.0, and 2026.2.1 — all affected** (2026.2.1 is the latest
+  release as of 2026-06-17)
+- Devices: Intel Arc 140V iGPU (Lunar Lake, Core Ultra 7 258V) — GPU plugin; originally
+  also observed on Intel Arc B390 iGPU (Panther Lake, Core Ultra X7 358H). Not observed
+  on the CPU plugin.
 - OS: Windows 11
-- Python: 3.11
-- Models: stateful LLM IRs containing ReadValue/Assign KV-cache state pairs (observed
-  across Llama 3.1 8B INT4, Llama 3.2 1B INT4, and Gemma 4 E2B FP32 exports, both
-  single-graph and per-stage pipeline shards; the Llama graphs additionally carry the
-  `Gather(ReadValue, beam_idx, axis=0)` cache-reorder pattern that
-  `optimum-intel`'s `fuse_cache_reorder` produces)
+- Python: 3.12
+- Models: stateful LLM IRs containing ReadValue/Assign KV-cache state pairs. Reproduced
+  on a **public, ungated** model — `EmbeddedLLM/Llama-3.2-1B-Instruct-int4-sym-ov`
+  (Llama architecture, INT4, with the `Gather(ReadValue, beam_idx, axis=0)` cache-reorder
+  pattern that `optimum-intel`'s `fuse_cache_reorder` produces). Originally observed on
+  Llama 3.1 8B INT4 / Llama 3.2 1B INT4 / Gemma 4 E2B FP32, single-graph and per-stage
+  pipeline shards.
 
 ## Summary
 
 Per the Model API documentation, multiple `InferRequest`s created from one
-`CompiledModel` should each maintain fully independent state. In practice, calling
-`reset_state()` on **one** `InferRequest` among several created from the **same**
-`CompiledModel` causes subsequent `infer()` calls on **any sibling request** to fail
-shape validation.
+`CompiledModel` should each maintain fully independent state. In practice, when two (or
+more) sibling `InferRequest`s from the **same** `CompiledModel` are driven
+**concurrently from separate threads** — each doing prefill → several decodes →
+`reset_state()` — the shared shape-inference state is corrupted, and a subsequent
+`infer()` on one of the requests fails validation with some node resolved to the empty
+shape `() -> ()`.
+
+**Important:** a single-threaded, sequential "reset one request, then infer a sibling"
+sequence does **not** reproduce this. The trigger is the concurrency — one stream's
+`reset_state()`/`infer()` landing while a sibling is mid-generation.
 
 ## Steps to reproduce
 
+Self-contained script (downloads a public stateful Llama IR if none is given):
+`reproduction/scripts/repro_reset_state_concurrent.py`. The essential structure:
+
 ```python
-import numpy as np
-import openvino as ov
+import threading, time, numpy as np, openvino as ov
 
 core = ov.Core()
-compiled = core.compile_model("llama-3.1-8b-int4-stateful.xml", "GPU")
+compiled = core.compile_model("openvino_model.xml", "GPU")   # ONE shared CompiledModel
+reqs = [compiled.create_infer_request() for _ in range(2)]   # sibling requests
 
-req_a = compiled.create_infer_request()
-req_b = compiled.create_infer_request()
-
-def feed(req, ids, past_len):
-    n = ids.shape[1]
+def feed(req, n, past):
     req.infer({
-        "input_ids": ids,
-        "attention_mask": np.ones((1, past_len + n), dtype=np.int64),
-        "position_ids": np.arange(past_len, past_len + n, dtype=np.int64).reshape(1, -1),
-        "beam_idx": np.zeros(1, dtype=np.int32),
+        "input_ids":      np.ones((1, n), dtype=np.int64),
+        "attention_mask": np.ones((1, past + n), dtype=np.int64),
+        "position_ids":   np.arange(past, past + n, dtype=np.int64).reshape(1, -1),
+        "beam_idx":       np.zeros(1, dtype=np.int32),
     })
 
-prompt = np.array([[1, 15043, 3186]], dtype=np.int64)
+errors = []
+def worker(sid):
+    req = reqs[sid]
+    time.sleep(sid * 0.13)               # stagger so the two streams interleave
+    try:
+        for _ in range(4):               # several run-and-reset cycles
+            feed(req, 4, 0)              # prefill
+            for d in range(8):           # decode steps
+                feed(req, 1, 4 + d); time.sleep(0.002)
+            req.reset_state()            # reset amid the sibling's activity
+    except Exception as e:
+        errors.append((sid, repr(e)))
 
-# 1. Run a full prefill + a few decode steps on req_a            -> OK
-feed(req_a, prompt, 0)
-feed(req_a, np.array([[42]], dtype=np.int64), prompt.shape[1])
-
-# 2. Run req_b concurrently/interleaved                          -> OK
-feed(req_b, prompt, 0)
-
-# 3. Reset ONE of the requests
-req_a.reset_state()
-
-# 4. Infer again on either request                               -> FAILS
-feed(req_a, prompt, 0)   # or feed(req_b, ...) — siblings also fail
+ts = [threading.Thread(target=worker, args=(s,)) for s in range(2)]
+[t.start() for t in ts]; [t.join() for t in ts]
+assert not errors, errors              # one stream fails with the shape error below
 ```
 
-The failure does not appear on the first prefill; it reliably occurs after at least one
-full run-and-reset cycle.
+Note: forcing the two prefills to run at *exactly* the same instant (e.g. a lock-step
+barrier) instead OOMs the iGPU (`CL_OUT_OF_RESOURCES`); the staggered/interleaved timing
+above surfaces the shape-inference corruption.
 
 ## Observed error
 
+The failing node varies between runs and OV versions, but it is consistently a
+shape-inference validation failure with one operand resolved to the empty tuple `()`:
+
+OV 2026.1.0 (an `opset1::Add`):
 ```
 Check 'TRShape::broadcast_merge_into(output_shape, input_shapes[1], autob)' failed at
   src/core/shape_inference/include/eltwise_shape_inference.hpp:28:
-While validating node 'opset1::Add Add_NNN () -> ()':
+While validating node 'opset1::Add Add_6583 () -> ()':
 Argument shapes are inconsistent.
 ```
 
-The specific `Add_NNN` node varies between runs and models; consistently, it is an
-`opset1::Add` whose broadcast merge resolves one argument shape to the empty tuple
-`()`.
+OV 2026.2.1 (same corruption, surfacing on an `opset1::MatMul`):
+```
+Check 'DimType::merge(...) || arg0_col_dim.is_dynamic() || arg1_row_dim.is_dynamic()'
+  failed at src/core/shape_inference/include/matmul_shape_inference.hpp:76:
+While validating node 'opset1::MatMul MatMul_4850 () -> ()':
+Incompatible MatMul matrix dimension. First input dimension=8192 ... doesn't match the
+  second input dimension=2048 ...
+```
+
+A concurrent GPU buffer race (`"The allocated input/output memory is necessary to set
+kernel arguments"`, `ocl_stream.cpp`) is occasionally seen instead, consistent with the
+same root cause: sharing one compiled graph's state across concurrently-driven requests.
+
+## Reproduction hit-rate
+
+12 concurrent trials per version (fresh `CompiledModel` each trial),
+`Llama-3.2-1B-Instruct int4`, Intel Arc 140V iGPU, GPU plugin:
+
+| OpenVINO | shape-inference corruption | GPU buffer race | clean |
+|----------|:--:|:--:|:--:|
+| 2026.1.0 | 10 / 12 | 1 / 12 | 1 / 12 |
+| 2026.2.0 | 12 / 12 | 0 | 0 |
+| **2026.2.1 (latest)** | **12 / 12** | 0 | 0 |
 
 ## Expected behavior
 
 Each `InferRequest` maintains independent state; `reset_state()` on one request should
-not affect shape inference on the request itself (after re-prefill) nor on sibling
-requests created from the same `CompiledModel`.
+not affect shape inference on the request itself nor on sibling requests created from
+the same `CompiledModel`, even when the requests are driven concurrently.
 
 ## Workaround
 
@@ -106,20 +151,22 @@ byte-identical to single-stream runs.
 
 ## Reproduction context
 
-A multi-stream coordinator that exercises this pattern (with the workaround applied) is
-available in this repository:
+- `reproduction/scripts/repro_reset_state_concurrent.py` — minimal standalone repro on a
+  public model (this is what the hit-rate table above was produced with).
+- `reproduction/scripts/coord/mini_coord_spec_mbatch.py`,
+  `reproduction/scripts/coord/gemma_2s_mbatch_coord.py` — the multi-stream coordinators
+  where the bug originally surfaced (with the per-stream `compile_model` workaround
+  applied).
 
-- `reproduction/scripts/coord/mini_coord_spec_mbatch.py` (per-stream `compile_model`
-  on both coordinator and worker)
-- `reproduction/scripts/coord/gemma_2s_mbatch_coord.py`
+## Pre-filing checklist (status as of 2026-06-17)
 
-## Pre-filing checklist (status as of 2026-06-11)
-
-- [x] Latest released OpenVINO checked: **2026.2.0** (`pip index versions openvino`,
-  2026-06-11) — the bug was observed on both 2026.1.0 and 2026.2.0, so the affected
-  list already includes the latest release.
-- [x] Prior-art search (2026-06-11): `gh search issues --repo=openvinotoolkit/openvino`
-  for `reset_state InferRequest`, `reset_state stateful`, `broadcast_merge_into Add`,
-  and `multiple InferRequest state` — no existing report found.
-- [ ] Before filing, re-confirm on whatever OpenVINO release is current at filing time
-  (re-run the repro above on an Arc iGPU machine) and re-search the tracker.
+- [x] Reproduced on the latest released OpenVINO **2026.2.1** — 12/12 concurrent trials
+  on an Arc 140V iGPU (and 2026.2.0 12/12, 2026.1.0 10/12).
+- [x] Reproduced on a **public, ungated** model
+  (`EmbeddedLLM/Llama-3.2-1B-Instruct-int4-sym-ov`), so the report needs no proprietary
+  artifact.
+- [x] Corrected the reproduction: the original single-threaded minimal repro did not
+  trigger the bug; the trigger is concurrent interleaved driving of sibling requests.
+- [ ] Re-run the prior-art search on the tracker immediately before filing
+  (`reset_state InferRequest`, `broadcast_merge_into`, `multiple InferRequest state`,
+  `concurrent reset_state`).
