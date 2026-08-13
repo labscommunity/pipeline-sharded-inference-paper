@@ -824,7 +824,90 @@ On CPU and GPU the mechanism is OpenVINO's own. An opt-in serving mode replaces 
 
 The NPU has no paged attention to borrow, and the direct route fails in the compiler. Reshaping a static shard's batch dimension from 1 to $N$ is rejected at every $N$ we tried, on both of the shard graph shapes tested, while the same graphs compile at batch~1. The failing pass, \texttt{ConvertBatchedLayerTo1N}, also reveals that the compiler's only strategy for a batched graph is to unroll it into $N$ batch-1 copies, so a legalized batch axis would amortize nothing anyway. The sequence axis has neither problem. The same export already compiles at sequence lengths above~1 (the chunked-prefill variant of \S\ref{sec:npu} depends on this), and NPU decode is weight-bound rather than KV-bound: on the Qwen2.5-1.5B INT4 stage measured below, one decode step streams 458~MB of weights against 29.3~MB of KV traffic per token, a 16:1 ratio. A single weight stream can therefore serve many query rows at marginal cost, provided the rows can be kept from attending to each other.
 
-Per-row isolation is exactly what the stock export cannot express: its \texttt{attention\_mask} input is a 2D $[1,T]$ vector shared by every query row. The exported graph, however, builds its 4D additive mask in a single node whose output feeds every attention block, and that mask input already carries a query dimension. A small graph edit replaces the node with a $[1,1,S,T]$ Parameter, handing mask construction to the host; the edit runs on an already-exported stage, with no PyTorch model and no re-trace. The host then partitions the fixed KV window into one contiguous region per slot and writes the mask each step: a block-diagonal pattern isolates $N$ decode rows, several rows assigned to one slot form a causal prefill chunk, and mixing the two runs prefill and decode in the same inference, which is the stall-free chunked scheduling of Sarathi-Serve~\cite{agrawal2024sarathi} obtained from the mask layout alone. Because a plan whose rows all belong to one slot is exactly a causal chunk, packed mode also drops the separate chunked-prefill graph of \S\ref{sec:npu}, saving one of the minutes-long NPU compiles and a second resident copy of the weights. Idle rows are opened on their own query column rather than fully masked, because a fully-blocked row produces NaN out of softmax and poisons the live rows sharing the inference.
+Per-row isolation is exactly what the stock export cannot express: its \texttt{attention\_mask} input is a 2D $[1,T]$ vector shared by every query row. The exported graph, however, builds its 4D additive mask in a single node whose output feeds every attention block, and that mask input already carries a query dimension. A small graph edit replaces the node with a $[1,1,S,T]$ Parameter, handing mask construction to the host; the edit runs on an already-exported stage, with no PyTorch model and no re-trace. The host then partitions the fixed KV window into one contiguous region per slot and writes the mask each step: a block-diagonal pattern isolates $N$ decode rows, several rows assigned to one slot form a causal prefill chunk, and mixing the two runs prefill and decode in the same inference, which is the stall-free chunked scheduling of Sarathi-Serve~\cite{agrawal2024sarathi} obtained from the mask layout alone. Because a plan whose rows all belong to one slot is exactly a causal chunk, packed mode also drops the separate chunked-prefill graph of \S\ref{sec:npu}, saving one of the minutes-long NPU compiles and a second resident copy of the weights. Idle rows are opened on their own query column rather than fully masked, because a fully-blocked row produces NaN out of softmax and poisons the live rows sharing the inference. Figure~\ref{fig:packedmask} shows one such plan.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  open/.style={fill=orange!45},
+  causal/.style={fill=orange!22},
+  shared/.style={fill=blue!22},
+  masked/.style={fill=black!5},
+  grid/.style={draw=black!45, line width=0.3pt},
+]
+\def\bw{1.45}
+\def\qw{0.34}
+\def\rh{0.56}
+\def\qx{7.55}
+
+% --- column bands: shared prefix, then one region per slot ---
+\foreach \i/\lab in {0/{shared}, 1/{slot 0}, 2/{slot 1}, 3/{slot 2}, 4/{slot 3}} {
+  \node[font=\scriptsize, align=center] at ({\i*\bw + \bw/2}, 0.62) {\lab};
+}
+\node[font=\scriptsize, align=center] at ({\qx + 2*\qw}, 0.62) {query};
+\node[font=\scriptsize\itshape, align=center] at ({2.5*\bw}, 1.12) {past-KV window, $T\!-\!S$ columns (255 per slot)};
+\node[font=\scriptsize\itshape] at ({\qx + 2*\qw}, 1.12) {$S$ cols};
+
+% --- background: everything masked, then open cells painted over ---
+\foreach \r in {0,1,2,3} {
+  \fill[masked] (0, {-\r*\rh}) rectangle ({5*\bw}, {-(\r+1)*\rh});
+  \foreach \q in {0,1,2,3} {
+    \fill[masked] ({\qx+\q*\qw}, {-\r*\rh}) rectangle ({\qx+(\q+1)*\qw}, {-(\r+1)*\rh});
+  }
+  % shared prefix: open for every row
+  \fill[shared] (0, {-\r*\rh}) rectangle (\bw, {-(\r+1)*\rh});
+}
+
+% --- per-row slot regions, open only to each slot's occupied depth ---
+\fill[open] ({1*\bw}, {-0*\rh}) rectangle ({1*\bw+0.72*\bw}, {-1*\rh});
+\fill[open] ({2*\bw}, {-1*\rh}) rectangle ({2*\bw+0.50*\bw}, {-2*\rh});
+\fill[open] ({3*\bw}, {-2*\rh}) rectangle ({3*\bw+0.24*\bw}, {-3*\rh});
+\fill[open] ({3*\bw}, {-3*\rh}) rectangle ({3*\bw+0.24*\bw}, {-4*\rh});
+
+% --- query columns: own column, plus earlier same-slot rows (causal) ---
+\fill[open]   ({\qx+0*\qw}, {-0*\rh}) rectangle ({\qx+1*\qw}, {-1*\rh});
+\fill[open]   ({\qx+1*\qw}, {-1*\rh}) rectangle ({\qx+2*\qw}, {-2*\rh});
+\fill[open]   ({\qx+2*\qw}, {-2*\rh}) rectangle ({\qx+3*\qw}, {-3*\rh});
+\fill[causal] ({\qx+2*\qw}, {-3*\rh}) rectangle ({\qx+3*\qw}, {-4*\rh});
+\fill[open]   ({\qx+3*\qw}, {-3*\rh}) rectangle ({\qx+4*\qw}, {-4*\rh});
+
+% --- grid lines ---
+\foreach \r in {0,1,2,3,4} {
+  \draw[grid] (0, {-\r*\rh}) -- ({5*\bw}, {-\r*\rh});
+  \draw[grid] ({\qx}, {-\r*\rh}) -- ({\qx+4*\qw}, {-\r*\rh});
+}
+\foreach \i in {0,1,2,3,4,5} { \draw[grid] ({\i*\bw}, 0) -- ({\i*\bw}, {-4*\rh}); }
+\foreach \q in {0,1,2,3,4} { \draw[grid] ({\qx+\q*\qw}, 0) -- ({\qx+\q*\qw}, {-4*\rh}); }
+
+% --- row labels ---
+\node[anchor=east, font=\scriptsize] at (-0.12, {-0.5*\rh}) {row 0};
+\node[anchor=east, font=\scriptsize] at (-0.12, {-1.5*\rh}) {row 1};
+\node[anchor=east, font=\scriptsize] at (-0.12, {-2.5*\rh}) {row 2};
+\node[anchor=east, font=\scriptsize] at (-0.12, {-3.5*\rh}) {row 3};
+
+% --- right-hand annotations ---
+\node[anchor=west, font=\scriptsize] at ({\qx+4*\qw+0.18}, {-0.5*\rh}) {decode, slot 0};
+\node[anchor=west, font=\scriptsize] at ({\qx+4*\qw+0.18}, {-1.5*\rh}) {decode, slot 1};
+\node[anchor=west, font=\scriptsize] at ({\qx+4*\qw+0.18}, {-3.0*\rh}) {prefill chunk, slot 2};
+\draw[decorate, decoration={brace, amplitude=3pt}, black!60]
+  ({\qx+4*\qw+0.12}, {-2*\rh+0.04}) -- ({\qx+4*\qw+0.12}, {-4*\rh+0.04});
+
+% --- free-slot callout, inside slot 3's own band ---
+\node[font=\scriptsize\itshape, text=black!55] at ({4*\bw+\bw/2}, {-2.5*\rh}) {free};
+
+% --- legend ---
+\begin{scope}[shift={(0, {-4*\rh-1.05})}]
+  \fill[shared] (0,0) rectangle (0.34,0.3); \node[anchor=west, font=\scriptsize] at (0.4,0.15) {shared prefix};
+  \fill[open] (2.55,0) rectangle (2.89,0.3); \node[anchor=west, font=\scriptsize] at (2.95,0.15) {open};
+  \fill[causal] (4.05,0) rectangle (4.39,0.3); \node[anchor=west, font=\scriptsize] at (4.45,0.15) {same-slot, earlier};
+  \fill[masked] (6.95,0) rectangle (7.29,0.3); \draw[grid] (6.95,0) rectangle (7.29,0.3);
+  \node[anchor=west, font=\scriptsize] at (7.35,0.15) {masked};
+\end{scope}
+\end{tikzpicture}
+\caption{One packed plan, drawn as the $[1,1,S,T]$ mask the host writes each step (4 slots, $S\!=\!4$; column widths not to scale). The past-KV window is partitioned into one contiguous region per slot, optionally behind a shared read-only prefix every row may attend to; the last $S$ columns are the current query positions. Rows~0 and~1 are decode steps on different slots and share nothing, which is the block-diagonal case. Rows~2 and~3 are a two-token prefill chunk for slot~2: they open their own slot's region and, among the query columns, only same-slot rows at or before them, so the chunk is causal. Both kinds run in one inference, which is split-fuse scheduling obtained from the mask layout alone. Slot~3 holds no row here and its region stays free for the next admission. Each row opens at least its own query column: a fully-blocked row returns NaN from softmax and would poison every live row in the inference.}
+\label{fig:packedmask}
+\end{figure}
 
 \begin{table}[ht]
 \centering
