@@ -7,10 +7,10 @@
 > INT4 OpenVINO IR subgraphs are exported via `torch.jit.trace` with precomputed rotary
 > embeddings and a post-export `beam_idx` Gather injection that unlocks the OpenVINO GPU
 > plugin's `IndirectKVCache` fusion. We introduce a mask-based KV-cache rewind that makes
-> speculative decoding practical on stateful OpenVINO without paged attention (1.35× mean
-> speedup on a single node; 1.65× at 2048 tokens). The sharded + speculative + 2-stream
-> micro-batched stack serves two concurrent users of Llama 3.1 8B at 41.25 tok/s total,
-> 1.89× the monolithic single-user baseline on the same hardware, and 4.04× naïve
+> speculative decoding practical on stateful OpenVINO without paged attention (1.33× mean
+> speedup on a single node; 1.58× at 2048 tokens). The sharded + speculative + 2-stream
+> micro-batched stack serves two concurrent users of Llama 3.1 8B at 43.97 tok/s total,
+> 1.79× the monolithic single-user baseline on the same hardware, and 4.04× naïve
 > distributed decode under a simulated 100 ms/hop WAN where naïve pipeline decode falls
 > below the interactive threshold.
 
